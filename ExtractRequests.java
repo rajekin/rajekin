@@ -1,25 +1,13 @@
 import javax.xml.stream.*;
-import javax.xml.stream.events.XMLEvent;
-import javax.xml.stream.events.Characters;
-import javax.xml.stream.events.StartElement;
-import javax.xml.stream.events.EndElement;
-import javax.xml.namespace.QName;
+import javax.xml.stream.events.*;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.DocumentBuilder;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
 import javax.xml.xpath.*;
+import org.w3c.dom.Document;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-/**
- * Usage:
- *   java ExtractRequestData input.xml output_dir
- *
- * For each <row> where Column(Name=TYPE, value=Request), this writes the inner XML
- * from Column(Name=DATA) to: <ApplicationNumber>_<DMFunction>.xml
- */
 public class ExtractRequestData {
 
     public static void main(String[] args) throws Exception {
@@ -35,7 +23,8 @@ public class ExtractRequestData {
         }
 
         XMLInputFactory factory = XMLInputFactory.newInstance();
-        factory.setProperty(XMLInputFactory.IS_COALESCING, true); // merge adjacent text nodes
+        factory.setProperty(XMLInputFactory.IS_COALESCING, true); // merge adjacent text
+
         try (InputStream in = new FileInputStream(input)) {
             XMLEventReader reader = factory.createXMLEventReader(in, StandardCharsets.UTF_8.name());
             process(reader, outDir);
@@ -43,13 +32,16 @@ public class ExtractRequestData {
     }
 
     private static void process(XMLEventReader reader, File outDir) throws Exception {
-        Map<String, String> currentRow = null;
+        Map<String, String> currentRow = null; // ColumnName -> value
         String currentColumnName = null;
         StringBuilder currentValueBuf = null;
+
         boolean insideRow = false;
         boolean insideColumn = false;
         boolean insideName = false;
         boolean insideValue = false;
+
+        int rowIndex = 0;
 
         while (reader.hasNext()) {
             XMLEvent ev = reader.nextEvent();
@@ -61,6 +53,7 @@ public class ExtractRequestData {
                 if ("row".equals(local)) {
                     insideRow = true;
                     currentRow = new LinkedHashMap<>();
+                    rowIndex++;
                 } else if (insideRow && "Column".equals(local)) {
                     insideColumn = true;
                     currentColumnName = null;
@@ -73,12 +66,14 @@ public class ExtractRequestData {
 
             } else if (ev.isCharacters()) {
                 Characters ch = ev.asCharacters();
-                if (insideName && ch.getData() != null) {
-                    // name text
-                    String n = ch.getData().trim();
-                    if (!n.isEmpty()) currentColumnName = n;
-                } else if (insideValue && ch.getData() != null) {
-                    currentValueBuf.append(ch.getData());
+                String text = ch.getData();
+                if (text != null) {
+                    if (insideName) {
+                        String n = text.trim();
+                        if (!n.isEmpty()) currentColumnName = n;
+                    } else if (insideValue) {
+                        currentValueBuf.append(text);
+                    }
                 }
 
             } else if (ev.isEndElement()) {
@@ -89,7 +84,6 @@ public class ExtractRequestData {
                     insideName = false;
                 } else if ("value".equals(local)) {
                     insideValue = false;
-                    // store accumulated value for this column name
                     if (insideColumn && currentColumnName != null) {
                         currentRow.put(currentColumnName, currentValueBuf == null ? "" : currentValueBuf.toString().trim());
                     }
@@ -97,8 +91,7 @@ public class ExtractRequestData {
                     insideColumn = false;
                     currentValueBuf = null;
                 } else if ("row".equals(local)) {
-                    // finished a row: evaluate
-                    handleRow(currentRow, outDir);
+                    handleRow(currentRow, outDir, rowIndex);
                     insideRow = false;
                     currentRow = null;
                 }
@@ -106,31 +99,30 @@ public class ExtractRequestData {
         }
     }
 
-    private static void handleRow(Map<String, String> row, File outDir) throws Exception {
+    private static void handleRow(Map<String, String> row, File outDir, int rowIndex) throws Exception {
         if (row == null) return;
 
-        // Condition: Column Name == TYPE has value == Request (case-insensitive)
+        // Must have TYPE=Request
         String typeVal = row.get("TYPE");
         if (typeVal == null || !typeVal.equalsIgnoreCase("Request")) return;
 
-        // Need DATA column
+        // Must have DATA column
         String dataEscaped = row.get("DATA");
         if (dataEscaped == null || dataEscaped.isEmpty()) return;
 
-        // Unescape XML entities (&lt; &gt; &amp; etc.)
+        // Unescape &lt; &gt; &amp; etc. to real XML
         String innerXml = unescapeXml(dataEscaped).trim();
         if (innerXml.isEmpty()) return;
 
-        // Parse the inner XML to pick filename parts
-        InnerMeta meta = extractInnerMeta(innerXml);
-        if (meta == null || meta.applicationNumber == null || meta.dmFunction == null) {
-            // Fallback: if meta missing, still write with a generic name
-            meta = meta == null ? new InnerMeta() : meta;
-            if (meta.applicationNumber == null) meta.applicationNumber = "UNKNOWN_APP";
-            if (meta.dmFunction == null) meta.dmFunction = "UNKNOWN_DM";
+        // --- Use YOUR EXACT XPaths ---
+        InnerMeta meta = extractWithYourXpath(innerXml);
+
+        if (meta == null || isBlank(meta.dmFunction) || isBlank(meta.applicationNumber)) {
+            System.err.println("Row " + rowIndex + ": missing DMfunction or ApplicationNumber; skipping.");
+            return;
         }
 
-        // Build file name and write
+        // Write file as <ApplicationNumber>_<DMfunction>.xml
         String safeApp = sanitize(meta.applicationNumber);
         String safeDM  = sanitize(meta.dmFunction);
         File out = new File(outDir, safeApp + "_" + safeDM + ".xml");
@@ -140,36 +132,39 @@ public class ExtractRequestData {
         System.out.println("Wrote: " + out.getAbsolutePath());
     }
 
-    // Extracts DMFunction (attribute of <CreditRequest>) and ApplicationNumber element text.
-    private static InnerMeta extractInnerMeta(String xml) {
+    // Parse inner XML and extract with the exact XPaths you provided.
+    private static InnerMeta extractWithYourXpath(String xml) {
         try {
             DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
             dbf.setNamespaceAware(false);
             dbf.setExpandEntityReferences(false);
             DocumentBuilder db = dbf.newDocumentBuilder();
-            Document doc = db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+            Document innerDoc = db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
 
-            XPathFactory xpf = XPathFactory.newInstance();
-            XPath xp = xpf.newXPath();
+            XPath xpath = XPathFactory.newInstance().newXPath();
+
+            // Extract DMfunction
+            String dmFunc = (String) xpath.evaluate(
+                "//*[local-name()='CreditRequest']/@DMfunction",
+                innerDoc, XPathConstants.STRING);
+
+            // Extract ApplicationNumber
+            String appNum = (String) xpath.evaluate(
+                "//*[local-name()='ApplicationNumber']/text()",
+                innerDoc, XPathConstants.STRING);
+
             InnerMeta m = new InnerMeta();
-            // DMFunction attribute on the root/first CreditRequest element
-            m.dmFunction = xp.evaluate("/*[@DMFunction]/@DMFunction", doc);
-            if (m.dmFunction == null || m.dmFunction.isEmpty()) {
-                // sometimes attribute may be lower/upper-cased differently—try case-insensitive-ish search
-                m.dmFunction = xp.evaluate("/*/@DMFUNCTION | /*/@dmfunction", doc);
-            }
-            // ApplicationNumber element anywhere
-            m.applicationNumber = xp.evaluate("//*[local-name()='ApplicationNumber' or name()='ApplicationNumber']/text()", doc);
-            if (m.applicationNumber != null) m.applicationNumber = m.applicationNumber.trim();
-            if (m.dmFunction != null) m.dmFunction = m.dmFunction.trim();
+            m.dmFunction = dmFunc != null ? dmFunc.trim() : null;
+            m.applicationNumber = appNum != null ? appNum.trim() : null;
             return m;
+
         } catch (Exception e) {
             System.err.println("Failed to parse inner XML: " + e.getMessage());
             return null;
         }
     }
 
-    // Minimal XML unescape (avoids 3rd-party deps). If you prefer, swap for Apache Commons Text.
+    // Minimal XML unescape (no external deps)
     private static String unescapeXml(String s) {
         return s.replace("&lt;", "<")
                 .replace("&gt;", ">")
@@ -180,6 +175,10 @@ public class ExtractRequestData {
 
     private static String sanitize(String s) {
         return s.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.trim().isEmpty();
     }
 
     private static class InnerMeta {
