@@ -4,6 +4,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.xpath.*;
 import org.w3c.dom.Document;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -47,6 +48,7 @@ public class ExtractRequestData {
                 else if (inRow && "Column".equals(tag)) { inCol = true; colName=null; }
                 else if (inCol && "Name".equals(tag)) { inName = true; }
                 else if (inCol && "value".equals(tag)) { inValue = true; valBuf = new StringBuilder(); }
+
             } else if (ev.isCharacters()) {
                 String t = ev.asCharacters().getData();
                 if (t != null) {
@@ -57,6 +59,7 @@ public class ExtractRequestData {
                         valBuf.append(t);
                     }
                 }
+
             } else if (ev.isEndElement()) {
                 String tag = ev.asEndElement().getName().getLocalPart();
                 if ("Name".equals(tag)) inName=false;
@@ -81,25 +84,27 @@ public class ExtractRequestData {
         String dataEscaped = row.get("DATA");
         if (dataEscaped == null || dataEscaped.isEmpty()) return;
 
-        // 1) Unescape entities
+        // 1) Unescape entities to get the inner fragment
         String inner = unescapeXml(dataEscaped);
 
-        // 2) Clean/wrap so it becomes well-formed XML
-        String cleanedFragment = cleanFragment(inner);
-        String wrapped = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload>\n" + cleanedFragment + "\n</Payload>";
+        // 2) Repair the fragment and wrap so it becomes well-formed XML
+        String repaired = repairFragment(inner);
+        String wrapped = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload>\n" + repaired + "\n</Payload>";
 
-        // 3) Parse the WRAPPED document
+        // 3) Parse the wrapped doc
         Document doc = parseXml(wrapped);
 
-        // 4) Extract values with strict + fallback XPaths
-        InnerMeta meta = extractMeta(doc);
+        // 4) Extract meta using STRICT paths first, then robust fallbacks
+        InnerMeta meta = extractMetaStrictThenFallback(doc);
 
         if (isBlank(meta.dmFunction) || isBlank(meta.applicationNumber)) {
             System.err.println("Row " + rowIndex + ": missing DMFunction or ApplicationNumber; skipping.");
+            // Uncomment for a quick peek at the content that failed
+            // System.err.println("--- DEBUG FRAGMENT START ---\n" + repaired.substring(0, Math.min(repaired.length(), 1200)) + "\n--- DEBUG FRAGMENT END ---");
             return;
         }
 
-        // 5) Write a proper XML file (the wrapped, cleaned version)
+        // 5) Write a *proper* XML file (wrapped, repaired)
         String safeApp = sanitize(meta.applicationNumber);
         String safeDM  = sanitize(meta.dmFunction);
         File out = new File(outDir, safeApp + "_" + safeDM + ".xml");
@@ -109,7 +114,74 @@ public class ExtractRequestData {
         System.out.println("Wrote: " + out.getAbsolutePath());
     }
 
-    // ---- XML parsing / extraction helpers ----
+    // ------------------------------------------------------------
+    //              META EXTRACTION (strict + fallback)
+    // ------------------------------------------------------------
+
+    private static InnerMeta extractMetaStrictThenFallback(Document wrappedDoc) throws Exception {
+        XPath xpath = XPathFactory.newInstance().newXPath();
+
+        // STRICT: only get ApplicationNumber under CreditApplication
+        String dmFuncStrict = (String) xpath.evaluate(
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
+            wrappedDoc, XPathConstants.STRING);
+
+        String appNumStrict = (String) xpath.evaluate(
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+            wrappedDoc, XPathConstants.STRING);
+
+        String dmFunc = trimOrNull(dmFuncStrict);
+        String appNum = trimOrNull(appNumStrict);
+
+        if (!isBlank(dmFunc) && !isBlank(appNum)) {
+            InnerMeta m = new InnerMeta();
+            m.dmFunction = dmFunc;
+            m.applicationNumber = appNum;
+            return m;
+        }
+
+        // FALLBACKS: previous robust method (attribute/element, namespace-agnostic, anywhere)
+        String[] dmPaths = new String[] {
+            // Element DMFunction under CreditRequest (ns-agnostic)
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
+            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
+            // Attribute variants in case some rows store it as attribute
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/@DMfunction",
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/@DMFunction",
+            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMfunction",
+            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMFunction",
+            // Last resort: any DMFunction element
+            "/*[local-name()='Payload']//*[local-name()='DMFunction']/text()"
+        };
+
+        String[] appNumPaths = new String[] {
+            // CreditApplication only (ns-agnostic)
+            "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+            // More permissive, anywhere
+            "/*[local-name()='Payload']//*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+            "/*[local-name()='Payload']//*[local-name()='ApplicationNumber']/text()"
+        };
+
+        String dmFuncFB = firstNonEmpty(xpath, wrappedDoc, dmPaths);
+        String appNumFB = firstNonEmpty(xpath, wrappedDoc, appNumPaths);
+
+        InnerMeta m = new InnerMeta();
+        m.dmFunction = trimOrNull(dmFuncFB);
+        m.applicationNumber = trimOrNull(appNumFB);
+        return m;
+    }
+
+    private static String firstNonEmpty(XPath xp, Document doc, String[] paths) throws Exception {
+        for (String p : paths) {
+            String v = (String) xp.evaluate(p, doc, XPathConstants.STRING);
+            if (!isBlank(v)) return v;
+        }
+        return null;
+    }
+
+    // ------------------------------------------------------------
+    //                    XML PARSE / REPAIR
+    // ------------------------------------------------------------
 
     private static Document parseXml(String xml) throws Exception {
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
@@ -124,63 +196,62 @@ public class ExtractRequestData {
         return db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static InnerMeta extractMeta(Document wrappedDoc) throws Exception {
-        XPath xp = XPathFactory.newInstance().newXPath();
-
-        // NOTE: we query under the wrapper root "Payload"
-        // DMFunction as element under Application/CreditRequest
-        String dmFunc = firstNonEmpty(xp, wrappedDoc, new String[] {
-            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
-            "//*/Application/CreditRequest/DMFunction/text()" // if no namespaces
-        });
-
-        // ApplicationNumber ONLY inside CreditApplication
-        String appNum = firstNonEmpty(xp, wrappedDoc, new String[] {
-            "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-            "//*/Application/CreditApplication//ApplicationNumber/text()"
-        });
-
-        InnerMeta m = new InnerMeta();
-        m.dmFunction = trimOrNull(dmFunc);
-        m.applicationNumber = trimOrNull(appNum);
-        return m;
-    }
-
-    // ---- Cleaning helpers to make malformed fragments parseable ----
-
-    private static String cleanFragment(String s) {
+    private static String repairFragment(String s) {
         if (s == null) return "";
-        String t = s;
 
-        // Remove BOM / zero-width / non-XML leading junk that triggers "content is not allowed in prolog"
-        t = t.replace("\uFEFF", "").replace("\u200B", "");
+        String t = s.replace("\uFEFF", "")     // BOM
+                    .replace("\u200B", "");    // zero-width space
 
-        // Drop everything before the first '<' and after the last '>'
+        // Keep only the XML-ish part
         int start = t.indexOf('<');
         int end   = t.lastIndexOf('>');
-        if (start > 0 || end >= 0) {
-            if (start >= 0 && end >= start) t = t.substring(start, end + 1);
-        }
+        if (start >= 0 && end >= start) t = t.substring(start, end + 1);
 
-        // Remove any XML declaration inside the fragment
+        // Remove inner XML declarations
         t = t.replaceAll("<\\?xml[^>]*\\?>", "");
 
-        // Fix bare ampersands that are not entities (common cause of “Element type …”)
+        // Fix bare '&' (but keep valid entities)
         t = t.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)", "&amp;");
 
-        t = t.trim();
-        return t;
+        // Ensure every '<' has a following '>' — if not, add it at the end of the segment
+        t = ensureAngles(t);
+
+        // If a start tag is immediately followed by another tag (no content), make it self-closing
+        // e.g., "<Tag ...><Next"  -> "<Tag .../><Next"
+        t = t.replaceAll("(<[A-Za-z_][\\w\\-.:]*[^<>]*?)>(\\s*)(?=<)", "$1/>$2");
+
+        return t.trim();
     }
 
-    // ---- Small utils ----
-
-    private static String firstNonEmpty(XPath xp, Document doc, String[] paths) throws Exception {
-        for (String p : paths) {
-            String v = (String) xp.evaluate(p, doc, XPathConstants.STRING);
-            if (!isBlank(v)) return v;
+    // Adds a missing '>' if a '<...>' chunk is missing it.
+    private static String ensureAngles(String xml) {
+        StringBuilder out = new StringBuilder(xml.length() + 32);
+        for (int i = 0; i < xml.length(); ) {
+            int lt = xml.indexOf('<', i);
+            if (lt < 0) {
+                out.append(xml, i, xml.length());
+                break;
+            }
+            // copy plain text before the tag
+            out.append(xml, i, lt);
+            int gt = xml.indexOf('>', lt + 1);
+            if (gt < 0) {
+                // No closing '>' — add one at the end of this run or line
+                int nl = xml.indexOf('\n', lt + 1);
+                int cut = (nl > 0 ? nl : xml.length());
+                out.append(xml, lt, cut).append('>');
+                i = cut;
+            } else {
+                out.append(xml, lt, gt + 1);
+                i = gt + 1;
+            }
         }
-        return null;
+        return out.toString();
     }
+
+    // ------------------------------------------------------------
+    //                  SMALL UTILS / DATA CLASS
+    // ------------------------------------------------------------
 
     private static String unescapeXml(String s) {
         return s.replace("&lt;", "<")
