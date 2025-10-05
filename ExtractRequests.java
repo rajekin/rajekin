@@ -5,13 +5,11 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.xpath.*;
 import org.w3c.dom.Document;
 
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Element;
-import org.jsoup.parser.Parser;
-
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class ExtractRequestData {
 
@@ -88,77 +86,135 @@ public class ExtractRequestData {
         String dataEscaped = row.get("DATA");
         if (dataEscaped == null || dataEscaped.isEmpty()) return;
 
+        // 1) Unescape entities to get the inner fragment
         String fragment = unescapeXml(dataEscaped);
 
-        // Wrap fragment so DOM has a single root
-        String wrapped = wrap(fragment);
+        // 2) Repair tag soup
+        String repaired = repairFragment(fragment);
 
+        // 3) Try to parse as a normal wrapped XML
+        String wrapped = wrapXml(repaired);
         Document doc = null;
+        boolean domOk = false;
         try {
             doc = parseDom(wrapped);
-        } catch (Exception domFail) {
-            // If DOM parsing fails (e.g., malformed tags), repair with jsoup
-            String repaired = tidyWithJsoup(fragment);
-            wrapped = wrap(repaired);
-            doc = parseDom(wrapped); // if this throws, we let it bubble
+            domOk = true;
+        } catch (Exception ignore) {
+            domOk = false;
         }
 
-        InnerMeta meta = extractMetaStrictThenFallback(doc);
-        if (isBlank(meta.dmFunction) || isBlank(meta.applicationNumber)) {
+        String dmFunc = null;
+        String appNum = null;
+
+        if (domOk) {
+            // STRICT first
+            XPath xp = XPathFactory.newInstance().newXPath();
+            dmFunc = (String) xp.evaluate(
+                "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
+                doc, XPathConstants.STRING);
+            appNum = (String) xp.evaluate(
+                "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+                doc, XPathConstants.STRING);
+
+            dmFunc = trimOrNull(dmFunc);
+            appNum = trimOrNull(appNum);
+
+            // FALLBACK (previous robust method)
+            if (isBlank(dmFunc) || isBlank(appNum)) {
+                String dmFB = firstNonEmpty(xp, doc, new String[] {
+                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
+                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMfunction",
+                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMFunction",
+                    "/*[local-name()='Payload']//*[local-name()='DMFunction']/text()"
+                });
+                String appFB = firstNonEmpty(xp, doc, new String[] {
+                    "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+                    "/*[local-name()='Payload']//*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
+                    "/*[local-name()='Payload']//*[local-name()='ApplicationNumber']/text()"
+                });
+                if (isBlank(dmFunc)) dmFunc = trimOrNull(dmFB);
+                if (isBlank(appNum)) appNum = trimOrNull(appFB);
+            }
+        }
+
+        // 4) If DOM still failed or metadata still missing, do regex fallback extraction (no XML parse)
+        if (!domOk || isBlank(dmFunc) || isBlank(appNum)) {
+            // Extract DMFunction (element or attribute on CreditRequest)
+            dmFunc = trimOrNull(regexDmFunction(repaired));
+            // Extract ApplicationNumber ONLY inside CreditApplication (fallback to global if needed)
+            appNum = trimOrNull(regexApplicationNumberInCreditApplication(repaired));
+            if (isBlank(appNum)) appNum = trimOrNull(regexApplicationNumberAnywhere(repaired));
+        }
+
+        if (isBlank(dmFunc) || isBlank(appNum)) {
             System.err.println("Row " + rowIndex + ": missing DMFunction or ApplicationNumber; skipping.");
             return;
         }
 
-        // Write cleaned, wrapped payload
-        String safeApp = sanitize(meta.applicationNumber);
-        String safeDM  = sanitize(meta.dmFunction);
+        // 5) Write output:
+        //    If DOM succeeded, we can keep the parsed-style wrapper; else, guarantee well-formed by CDATA.
+        String output;
+        if (domOk) {
+            output = wrapped; // already well-formed <Payload>…</Payload>
+        } else {
+            output = wrapAsCdata(repaired); // guaranteed well-formed even if inner is broken
+        }
+
+        String safeApp = sanitize(appNum);
+        String safeDM  = sanitize(dmFunc);
         File out = new File(outDir, safeApp + "_" + safeDM + ".xml");
         try (Writer w = new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8)) {
-            w.write(wrapped);
+            w.write(output);
         }
         System.out.println("Wrote: " + out.getAbsolutePath());
     }
 
-    // ------------- META (strict + previous robust fallback) -------------
+    // -------------------- Regex fallbacks --------------------
 
-    private static InnerMeta extractMetaStrictThenFallback(Document wrappedDoc) throws Exception {
-        XPath xp = XPathFactory.newInstance().newXPath();
+    private static String regexDmFunction(String s) {
+        if (s == null) return null;
 
-        // STRICT (namespace-agnostic)
-        String dmFunc = (String) xp.evaluate(
-            "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
-            wrappedDoc, XPathConstants.STRING);
-        String appNum = (String) xp.evaluate(
-            "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-            wrappedDoc, XPathConstants.STRING);
+        // 1) <DMFunction>value</DMFunction>
+        Matcher m = Pattern.compile("<\\s*DMFunction\\s*>(.*?)</\\s*DMFunction\\s*>",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
+        if (m.find()) return m.group(1).trim();
 
-        dmFunc = trimOrNull(dmFunc);
-        appNum = trimOrNull(appNum);
-        if (!isBlank(dmFunc) && !isBlank(appNum)) {
-            InnerMeta m = new InnerMeta(); m.dmFunction=dmFunc; m.applicationNumber=appNum; return m;
-        }
+        // 2) CreditRequest ... DMfunction="value"  (or DMFunction=)
+        m = Pattern.compile("<\\s*CreditRequest\\b[^>]*\\bDM[Ff]unction\\s*=\\s*\"([^\"]+)\"",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
+        if (m.find()) return m.group(1).trim();
 
-        // FALLBACKS (your previous method + extras)
-        String[] dmPaths = new String[] {
-            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
-            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMfunction",
-            "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMFunction",
-            "/*[local-name()='Payload']//*[local-name()='DMFunction']/text()"
-        };
-        String[] appNumPaths = new String[] {
-            "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-            "/*[local-name()='Payload']//*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-            "/*[local-name()='Payload']//*[local-name()='ApplicationNumber']/text()"
-        };
+        m = Pattern.compile("<\\s*CreditRequest\\b[^>]*\\bDM[Ff]unction\\s*=\\s*'([^']+)'",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
+        if (m.find()) return m.group(1).trim();
 
-        String dmFB = firstNonEmpty(xp, wrappedDoc, dmPaths);
-        String appFB = firstNonEmpty(xp, wrappedDoc, appNumPaths);
-
-        InnerMeta m = new InnerMeta();
-        m.dmFunction = trimOrNull(dmFB);
-        m.applicationNumber = trimOrNull(appFB);
-        return m;
+        return null;
     }
+
+    private static String regexApplicationNumberInCreditApplication(String s) {
+        if (s == null) return null;
+
+        // Find the <CreditApplication> ... </CreditApplication> region first (most tolerant)
+        Matcher region = Pattern.compile("<\\s*CreditApplication\\b(?s).*?</\\s*CreditApplication\\s*>",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
+        if (region.find()) {
+            String scope = region.group(0);
+            Matcher m = Pattern.compile("<\\s*ApplicationNumber\\s*>(.*?)</\\s*ApplicationNumber\\s*>",
+                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(scope);
+            if (m.find()) return m.group(1).trim();
+        }
+        return null;
+    }
+
+    private static String regexApplicationNumberAnywhere(String s) {
+        if (s == null) return null;
+        Matcher m = Pattern.compile("<\\s*ApplicationNumber\\s*>(.*?)</\\s*ApplicationNumber\\s*>",
+                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
+        if (m.find()) return m.group(1).trim();
+        return null;
+    }
+
+    // -------------------- XPath helpers ---------------------
 
     private static String firstNonEmpty(XPath xp, Document doc, String[] paths) throws Exception {
         for (String p : paths) {
@@ -168,7 +224,7 @@ public class ExtractRequestData {
         return null;
     }
 
-    // --------------------- Parsing helpers ---------------------
+    // -------------------- Parse / Repair --------------------
 
     private static Document parseDom(String xml) throws Exception {
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
@@ -183,40 +239,79 @@ public class ExtractRequestData {
         return db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static String tidyWithJsoup(String fragment) {
-        // Use lenient HTML parser to fix tag soup (missing '>', unclosed tags, etc.)
-        org.jsoup.nodes.Document html = Jsoup.parse(fragment, "", org.jsoup.parser.Parser.htmlParser());
-        // Move body children under a synthetic root to keep structure
-        Element root = new Element("Payload");
-        for (org.jsoup.nodes.Node n : html.body().childNodes()) {
-            root.appendChild(n.clone());
-        }
-        org.jsoup.nodes.Document xmlDoc = org.jsoup.nodes.Document.createShell("");
-        xmlDoc.removeClass(""); // no-op, just to keep compiler quiet about xmlDoc usage
-        // Serialize as XML (self-closes empty tags, ensures angle brackets, etc.)
-        org.jsoup.nodes.Document out = new org.jsoup.nodes.Document("");
-        out.appendChild(root);
-        out.outputSettings().syntax(org.jsoup.nodes.Document.OutputSettings.Syntax.xml);
-        out.outputSettings().escapeMode(org.jsoup.nodes.Entities.EscapeMode.base);
-        out.outputSettings().prettyPrint(false);
-        return out.outerHtml()
-                  .replaceFirst("^<Payload>", "")      // strip the extra wrapper we just added
-                  .replaceFirst("</Payload>$", "");
+    private static String repairFragment(String s) {
+        if (s == null) return "";
+
+        String t = s.replace("\uFEFF", "")     // BOM
+                    .replace("\u200B", "");    // zero-width space
+
+        // Keep only the XML-ish part
+        int start = t.indexOf('<');
+        int end   = t.lastIndexOf('>');
+        if (start >= 0 && end >= start) t = t.substring(start, end + 1);
+
+        // Remove inner XML declarations
+        t = t.replaceAll("<\\?xml[^>]*\\?>", "");
+
+        // Fix bare '&' (but keep valid entities)
+        t = t.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)", "&amp;");
+
+        // Ensure tags have a closing '>' — aggressively
+        t = forceAngles(t);
+
+        // Auto self-close empty start tags that are immediately followed by another tag
+        t = t.replaceAll("(<[A-Za-z_][\\w\\-.:]*[^<>]*?)>(\\s*)(?=<)", "$1/>$2");
+
+        return t.trim();
     }
 
-    private static String wrap(String fragment) {
-        String cleaned = fragment == null ? "" : fragment.replace("\uFEFF", "").replace("\u200B","").trim();
-        // drop anything before first '<' and after last '>'
+    // More aggressive than before: if a '<' opens and the next '>' is missing or appears after another '<',
+    // insert a '>' right before that next '<' (or at end of string).
+    private static String forceAngles(String xml) {
+        StringBuilder out = new StringBuilder(xml.length() + 64);
+        int i = 0;
+        while (i < xml.length()) {
+            int lt = xml.indexOf('<', i);
+            if (lt < 0) { out.append(xml, i, xml.length()); break; }
+            out.append(xml, i, lt);
+            int gt = xml.indexOf('>', lt + 1);
+            int nextLt = xml.indexOf('<', lt + 1);
+
+            if (gt < 0 && nextLt < 0) {
+                // No '>' and no next '<' — close at end
+                out.append(xml, lt, xml.length()).append('>');
+                i = xml.length();
+            } else if (gt >= 0 && (nextLt < 0 || gt < nextLt)) {
+                // Normal well-formed tag or '>' before next '<'
+                out.append(xml, lt, gt + 1);
+                i = gt + 1;
+            } else {
+                // There is a next '<' before any '>' — insert a '>' just before that next '<'
+                out.append(xml, lt, nextLt).append('>');
+                i = nextLt;
+            }
+        }
+        return out.toString();
+    }
+
+    private static String wrapXml(String fragment) {
+        String cleaned = fragment == null ? "" : fragment.trim();
+        // Drop leading junk before first '<' and trailing after last '>'
         int s = cleaned.indexOf('<'); int e = cleaned.lastIndexOf('>');
         if (s >= 0 && e >= s) cleaned = cleaned.substring(s, e+1);
-        // remove inner XML declarations if present
+        // Remove any inner XML decl left
         cleaned = cleaned.replaceAll("<\\?xml[^>]*\\?>", "");
-        // fix bare ampersands
+        // Fix stray ampersands once more (safety)
         cleaned = cleaned.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)", "&amp;");
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload>\n" + cleaned + "\n</Payload>";
+        }
+
+    private static String wrapAsCdata(String fragment) {
+        String c = fragment == null ? "" : fragment.replace("]]>", "]]]]><![CDATA[>");
+        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload><![CDATA[\n" + c + "\n]]></Payload>";
     }
 
-    // ---------------------- Small utils -----------------------
+    // -------------------- Small utils --------------------
 
     private static String unescapeXml(String s) {
         return s.replace("&lt;", "<")
@@ -233,6 +328,7 @@ public class ExtractRequestData {
     private static boolean isBlank(String s) {
         return s == null || s.trim().isEmpty();
     }
+
     private static String trimOrNull(String s) {
         if (s == null) return null;
         String t = s.trim();
