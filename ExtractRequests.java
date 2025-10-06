@@ -1,4 +1,3 @@
-package tools.insomnia2soapuixml;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -236,4 +235,77 @@ public class InsomniaToSoapUiXml {
     x.writeEndElement();
   }
 
-  private static String di
+  private static String displayName(String path) {
+    if (path == null || path.isBlank() || "/".equals(path)) return "/";
+    return path.startsWith("/") ? path.substring(1) : path;
+  }
+
+  private static URI safeUri(String url) {
+    try { return URI.create(url); }
+    catch (Exception e) { return URI.create("http://invalid/"); }
+  }
+
+  private static String detectMediaType(JsonNode req) {
+    String mt = req.path("body").path("mimeType").asText("");
+    if (!mt.isBlank()) return mt;
+    String t = readBody(req).trim();
+    if ((t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))) return "application/json";
+    if (t.startsWith("<") && t.endsWith(">")) return "application/xml";
+    // header fallback
+    for (JsonNode h : iterable(req.path("headers"))) {
+      if ("content-type".equalsIgnoreCase(h.path("name").asText(""))) {
+        String v = h.path("value").asText("");
+        if (!v.isBlank()) return v;
+      }
+    }
+    return "application/json";
+  }
+
+  private static String readBody(JsonNode req) {
+    JsonNode b = req.path("body");
+    if (b.isObject()) {
+      return b.path("text").asText("");
+    } else if (b.isTextual()) {
+      return b.asText("");
+    }
+    return "";
+  }
+
+  private static Iterable<JsonNode> iterable(JsonNode node) {
+    return node != null && node.isArray() ? node::elements : Collections::emptyIterator;
+  }
+
+  /**
+   * Builds the inner value for the SoapUI setting
+   *   id="com.eviware.soapui.impl.wsdl.WsdlRequest@request-headers"
+   * SoapUI stores request headers as an XML fragment inside that setting.
+   * We emit: &lt;xml-fragment xmlns:con="...">&lt;con:entry key="K" value="V"/>...&lt;/xml-fragment>
+   * The whole fragment is inserted as text (SoapUI expects the XML to be entity-escaped).
+   */
+  private static String buildHeadersXmlFragment(JsonNode req) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("<xml-fragment xmlns:con=\"").append(NS_CON).append("\">");
+    for (JsonNode h : iterable(req.path("headers"))) {
+      if (h.path("disabled").asBoolean(false)) continue;
+      String name = h.path("name").asText("");
+      String value = h.path("value").asText("");
+      if (name.isBlank()) continue;
+      sb.append("<con:entry key=\"")
+        .append(escapeXmlAttr(name)).append("\" value=\"")
+        .append(escapeXmlAttr(value)).append("\"/>");
+    }
+    sb.append("</xml-fragment>");
+    // SoapUI expects this fragment to be XML-escaped in the project file.
+    return sb.toString().replace("<", "&lt;").replace(">", "&gt;");
+  }
+
+  private static String escapeXmlAttr(String s) {
+    if (s == null) return "";
+    return s.replace("&", "&amp;").replace("\"", "&quot;").replace("<", "&lt;").replace(">", "&gt;");
+  }
+
+  @SuppressWarnings("unused")
+  private static String urlDecode(String s) {
+    try { return URLDecoder.decode(s, StandardCharsets.UTF_8); } catch (Exception e) { return s; }
+  }
+}
