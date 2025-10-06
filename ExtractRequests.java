@@ -10,6 +10,7 @@ import java.io.*;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.regex.Pattern;
 
 public class InsomniaToSoapUiXml {
 
@@ -28,13 +29,14 @@ public class InsomniaToSoapUiXml {
     JsonNode root = readInsomnia(input);
     List<JsonNode> requests = extractRequests(root);
     if (requests.isEmpty()) {
-      throw new IllegalArgumentException("No request nodes found. Supported: top-level 'resources[]' OR a 'type/children' tree with request leaves.");
+      throw new IllegalArgumentException("No request nodes found. Supported: top-level 'resources[]', or 'collections[]/children[]' trees, or any node with 'url'.");
     }
 
     // Group by base endpoint scheme://host[:port]
     Map<String, List<JsonNode>> byHost = new LinkedHashMap<>();
     for (JsonNode r : requests) {
-      URI uri = safeUri(r.path("url").asText(""));
+      String rawUrl = r.path("url").asText("");
+      URI uri = parseUriFromInsomniaUrl(rawUrl);
       String hostKey = ((uri.getScheme() == null) ? "http" : uri.getScheme()) + "://" + ((uri.getHost() == null) ? "invalid" : uri.getHost());
       if (uri.getPort() > 0) hostKey += ":" + uri.getPort();
       byHost.computeIfAbsent(hostKey, k -> new ArrayList<>()).add(r);
@@ -60,7 +62,6 @@ public class InsomniaToSoapUiXml {
       attr(x, "abortOnError", "false");
       attr(x, "runType", "SEQUENTIAL");
 
-      // project-level sections (minimal)
       elemEmpty(x, "settings");
 
       // Interfaces (one per host)
@@ -89,7 +90,7 @@ public class InsomniaToSoapUiXml {
         // Group by path under this host
         Map<String, List<JsonNode>> byPath = new LinkedHashMap<>();
         for (JsonNode r : entry.getValue()) {
-          URI uri = safeUri(r.path("url").asText(""));
+          URI uri = parseUriFromInsomniaUrl(r.path("url").asText(""));
           String path = defaultStr(uri.getRawPath(), "/");
           byPath.computeIfAbsent(path, k -> new ArrayList<>()).add(r);
         }
@@ -134,9 +135,9 @@ public class InsomniaToSoapUiXml {
             // Requests
             for (JsonNode req : verbEntry.getValue()) {
               String reqName = defaultStr(req.path("name").asText(""), verb + " " + path);
-              URI uri = safeUri(req.path("url").asText(""));
+              URI uri = parseUriFromInsomniaUrl(req.path("url").asText(""));
               String mediaType = detectMediaType(req);
-              String body = readBody(req);
+              String body = cleanupBody(readBody(req));
 
               x.writeStartElement(NS_CON, "request");
               attr(x, "name", reqName);
@@ -213,7 +214,7 @@ public class InsomniaToSoapUiXml {
     }
   }
 
-  /** Supports both classic `resources[]` and tree-style `type/children` exports. */
+  /** Supports classic `resources[]`, tree-style `type/children`, and Insomnia `collections[]/children[]`. */
   private static List<JsonNode> extractRequests(JsonNode root) {
     List<JsonNode> out = new ArrayList<>();
 
@@ -224,23 +225,52 @@ public class InsomniaToSoapUiXml {
       if (!out.isEmpty()) return out;
     }
 
-    // Case B: recursive type/children
+    // Case B: collections[] trees
+    JsonNode cols = root.path("collections");
+    if (cols.isArray()) {
+      for (JsonNode c : cols) collectFromChildren(c, out);
+      if (!out.isEmpty()) return out;
+    }
+
+    // Case C: generic type/children anywhere
+    collectFromChildren(root, out);
+    return out;
+  }
+
+  private static void collectFromChildren(JsonNode node, List<JsonNode> out) {
     Deque<JsonNode> stack = new ArrayDeque<>();
-    stack.push(root);
+    stack.push(node);
     while (!stack.isEmpty()) {
       JsonNode n = stack.pop();
       if (isRequestNode(n)) out.add(n);
       JsonNode kids = n.path("children");
       if (kids.isArray()) kids.forEach(stack::push);
     }
-    return out;
   }
 
   private static boolean isRequestNode(JsonNode n) {
     String t1 = n.path("_type").asText("");
     String t2 = n.path("type").asText("");
     if ("request".equalsIgnoreCase(t1) || "request".equalsIgnoreCase(t2)) return true;
-    return n.has("url") && (n.has("method") || n.has("name")); // heuristic
+    // Heuristic: leaf with URL (Insomnia YAML often uses no explicit type on leaves)
+    return n.has("url");
+  }
+
+  /** Insomnia URLs can contain {{variables}}. Replace them with placeholders so URI parsing succeeds. */
+  private static URI parseUriFromInsomniaUrl(String raw) {
+    if (raw == null || raw.isBlank()) return URI.create("http://invalid/");
+    String s = raw.trim();
+
+    // If starts with http(s)://{{...}}/path → replace {{...}} with "env"
+    s = s.replaceAll("(?i)^(https?://)\\s*\\{\\{[^}]+}}", "$1env");
+    // Replace any remaining {{...}} with "env" (safe placeholder)
+    s = s.replaceAll("\\{\\{[^}]+}}", "env");
+
+    // Remove accidental spaces inside scheme or after slashes
+    s = s.replaceAll("(?i)^(https?)\\s*://", "$1://");
+
+    try { return URI.create(s); }
+    catch (Exception ignore) { return URI.create("http://invalid/"); }
   }
 
   private static String detectMediaType(JsonNode req) {
@@ -260,6 +290,11 @@ public class InsomniaToSoapUiXml {
           if (!v.isBlank()) return v;
         }
       }
+    } else if (headers.isObject()) {
+      // headers as map
+      JsonNode ct = headers.get("Content-Type");
+      if (ct == null) ct = headers.get("content-type");
+      if (ct != null && ct.isTextual() && !ct.asText().isBlank()) return ct.asText();
     }
     return "application/json";
   }
@@ -269,6 +304,13 @@ public class InsomniaToSoapUiXml {
     if (b.isObject()) return b.path("text").asText("");
     if (b.isTextual()) return b.asText("");
     return "";
+  }
+
+  /** Remove lines that are just "\" (common in quoted YAML dumps) and trim trailing whitespace. */
+  private static String cleanupBody(String body) {
+    if (body == null) return "";
+    String cleaned = Pattern.compile("(?m)^\\\\\\s*$").matcher(body).replaceAll(""); // drop lines that are only "\"
+    return cleaned.trim();
   }
 
   private static String defaultStr(String value, String fallback) {
@@ -296,15 +338,11 @@ public class InsomniaToSoapUiXml {
     return path.startsWith("/") ? path.substring(1) : path;
   }
 
-  private static URI safeUri(String url) {
-    try { return URI.create(url); }
-    catch (Exception e) { return URI.create("http://invalid/"); }
-  }
-
-  /** SoapUI stores request headers in a `request-headers` XML fragment setting. */
+  /** SoapUI stores request headers in a `request-headers` XML fragment setting. Supports list OR map. */
   private static String buildHeadersXmlFragment(JsonNode req) {
     StringBuilder sb = new StringBuilder();
     sb.append("<xml-fragment xmlns:con=\"").append(NS_CON).append("\">");
+
     JsonNode headers = req.path("headers");
     if (headers.isArray()) {
       for (JsonNode h : headers) {
@@ -315,7 +353,18 @@ public class InsomniaToSoapUiXml {
         sb.append("<con:entry key=\"").append(escapeXmlAttr(name))
           .append("\" value=\"").append(escapeXmlAttr(value)).append("\"/>");
       }
+    } else if (headers.isObject()) {
+      Iterator<String> it = headers.fieldNames();
+      while (it.hasNext()) {
+        String name = it.next();
+        JsonNode v = headers.get(name);
+        String value = v == null ? "" : v.asText("");
+        if (name == null || name.isBlank()) continue;
+        sb.append("<con:entry key=\"").append(escapeXmlAttr(name))
+          .append("\" value=\"").append(escapeXmlAttr(value)).append("\"/>");
+      }
     }
+
     sb.append("</xml-fragment>");
     // Must be entity-escaped when embedded as a setting value.
     return sb.toString().replace("<", "&lt;").replace(">", "&gt;");
