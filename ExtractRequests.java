@@ -1,342 +1,348 @@
-import javax.xml.stream.*;
-import javax.xml.stream.events.*;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.xpath.*;
-import org.w3c.dom.Document;
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
 
-import java.io.*;
+  <groupId>tools.insomnia2soapui</groupId>
+  <artifactId>insomnia2soapui</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <jackson.version>2.17.1</jackson.version>
+    <soapui.version>5.7.0</soapui.version>
+  </properties>
+
+  <dependencies>
+    <!-- Jackson (JSON + YAML) -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.dataformat</groupId>
+      <artifactId>jackson-dataformat-yaml</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!-- SoapUI OSS (project/model APIs) -->
+    <dependency>
+      <groupId>org.soapui</groupId>
+      <artifactId>soapui</artifactId>
+      <version>${soapui.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Build an executable jar with dependencies for easy running -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-assembly-plugin</artifactId>
+        <version>3.6.0</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>tools.insomnia2soapui.InsomniaToSoapUI</mainClass>
+            </manifest>
+          </archive>
+          <descriptorRefs>
+            <descriptorRef>jar-with-dependencies</descriptorRef>
+          </descriptorRefs>
+        </configuration>
+        <executions>
+          <execution>
+            <id>make-assembly</id>
+            <phase>package</phase>
+            <goals><goal>single</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+
+package tools.insomnia2soapui;
+
+import com.eviware.soapui.impl.rest.RestMethod;
+import com.eviware.soapui.impl.rest.RestRequest;
+import com.eviware.soapui.impl.rest.RestRequestInterface;
+import com.eviware.soapui.impl.rest.RestResource;
+import com.eviware.soapui.impl.rest.RestService;
+import com.eviware.soapui.impl.rest.RestServiceFactory;
+import com.eviware.soapui.impl.wsdl.WsdlProject;
+import com.eviware.soapui.support.types.StringToStringsMap;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
-public class ExtractRequestData {
+/**
+ * Insomnia v5+ export (YAML or JSON) -> SoapUI REST project (.xml).
+ *
+ * Usage:
+ *   java -jar insomnia2soapui-1.0.0-jar-with-dependencies.jar export.yaml SoapUI-Project.xml
+ */
+public class InsomniaToSoapUI {
 
-    public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("Usage: java ExtractRequestData <input-xml> <output-dir>");
-            System.exit(1);
-        }
+  public static void main(String[] args) throws Exception {
+    if (args.length < 2) {
+      System.err.println("Usage: java -jar insomnia2soapui-<ver>-jar-with-dependencies.jar <insomnia-export.(yaml|yml|json)> <output-soapui-project.xml>");
+      System.exit(1);
+    }
+    File input = new File(args[0]);
+    File output = new File(args[1]);
 
-        File input = new File(args[0]);
-        File outDir = new File(args[1]);
-        if (!outDir.exists() && !outDir.mkdirs()) {
-            throw new IOException("Cannot create output dir: " + outDir.getAbsolutePath());
-        }
+    JsonNode root = readInsomniaTree(input);
 
-        XMLInputFactory factory = XMLInputFactory.newInstance();
-        factory.setProperty(XMLInputFactory.IS_COALESCING, true);
-
-        try (InputStream in = new FileInputStream(input)) {
-            XMLEventReader reader = factory.createXMLEventReader(in, StandardCharsets.UTF_8.name());
-            process(reader, outDir);
-        }
+    // Insomnia collections generally have top-level "resources" containing objects with _type == "request"
+    JsonNode resources = root.path("resources");
+    if (!resources.isArray()) {
+      throw new IllegalArgumentException("Not an Insomnia v5+ export: missing top-level 'resources' array.");
     }
 
-    private static void process(XMLEventReader reader, File outDir) throws Exception {
-        Map<String, String> row = null;
-        String colName = null;
-        StringBuilder valBuf = null;
-        boolean inRow=false, inCol=false, inName=false, inValue=false;
-        int rowIndex = 0;
+    // Collect requests
+    List<JsonNode> requests = new ArrayList<>();
+    for (JsonNode r : resources) {
+      if ("request".equalsIgnoreCase(r.path("_type").asText())) {
+        requests.add(r);
+      }
+    }
+    if (requests.isEmpty()) {
+      System.out.println("No requests found in the Insomnia export.");
+      return;
+    }
 
-        while (reader.hasNext()) {
-            XMLEvent ev = reader.nextEvent();
+    // Group by base endpoint (scheme://host[:port]) -> one RestService per host
+    Map<String, List<JsonNode>> byHost = new LinkedHashMap<>();
+    for (JsonNode req : requests) {
+      String u = req.path("url").asText("");
+      URI uri = safeUri(u);
+      String hostKey = (uri.getScheme() == null ? "http" : uri.getScheme()) + "://" + (uri.getHost() == null ? "invalid" : uri.getHost());
+      if (uri.getPort() > 0) hostKey += ":" + uri.getPort();
+      byHost.computeIfAbsent(hostKey, k -> new ArrayList<>()).add(req);
+    }
 
-            if (ev.isStartElement()) {
-                String tag = ev.asStartElement().getName().getLocalPart();
-                if ("row".equals(tag)) { inRow = true; row = new LinkedHashMap<>(); rowIndex++; }
-                else if (inRow && "Column".equals(tag)) { inCol = true; colName=null; }
-                else if (inCol && "Name".equals(tag)) { inName = true; }
-                else if (inCol && "value".equals(tag)) { inValue = true; valBuf = new StringBuilder(); }
+    // Create SoapUI project
+    WsdlProject project = new WsdlProject();
+    String projectName = root.path("name").asText("");
+    project.setName(projectName.isBlank() ? "Imported from Insomnia" : projectName);
 
-            } else if (ev.isCharacters()) {
-                String t = ev.asCharacters().getData();
-                if (t != null) {
-                    if (inName) {
-                        String n = t.trim();
-                        if (!n.isEmpty()) colName = n;
-                    } else if (inValue) {
-                        valBuf.append(t);
-                    }
-                }
+    int serviceIndex = 1;
+    for (Map.Entry<String, List<JsonNode>> entry : byHost.entrySet()) {
+      String baseEndpoint = entry.getKey();
+      String serviceName = "Service " + serviceIndex++ + " - " + baseEndpoint;
 
-            } else if (ev.isEndElement()) {
-                String tag = ev.asEndElement().getName().getLocalPart();
-                if ("Name".equals(tag)) inName=false;
-                else if ("value".equals(tag)) {
-                    inValue=false;
-                    if (inCol && colName != null) row.put(colName, valBuf==null?"":valBuf.toString().trim());
-                } else if ("Column".equals(tag)) { inCol=false; valBuf=null; }
-                else if ("row".equals(tag)) {
-                    handleRow(row, outDir, rowIndex);
-                    inRow=false; row=null;
-                }
+      RestService service = (RestService) project.addNewInterface(serviceName, RestServiceFactory.REST_TYPE);
+      service.addNewEndpoint(baseEndpoint);
+
+      // Resource cache per path
+      Map<String, RestResource> resourceMap = new LinkedHashMap<>();
+
+      // stable order
+      List<JsonNode> hostRequests = new ArrayList<>(entry.getValue());
+      hostRequests.sort(Comparator.comparing(n -> n.path("name").asText("")));
+
+      int reqCounter = 1;
+      for (JsonNode req : hostRequests) {
+        String name = nonEmpty(req.path("name").asText(""), "Request " + reqCounter++);
+        String methodStr = nonEmpty(req.path("method").asText(""), "GET");
+        RestRequestInterface.HttpMethod httpMethod = httpMethodOf(methodStr);
+
+        URI uri = safeUri(req.path("url").asText(""));
+        String path = nonEmpty(uri.getRawPath(), "/");
+
+        // Make/find resource by path
+        RestResource resource = resourceMap.computeIfAbsent(path, p -> {
+          String display = p.startsWith("/") ? p.substring(1) : p;
+          return service.addNewResource(display.isBlank() ? "/" : display, p.isBlank() ? "/" : p);
+        });
+
+        // Reuse or create a RestMethod for this HTTP verb under the resource
+        RestMethod restMethod = findOrCreateMethod(resource, httpMethod);
+
+        // Create a request under the method
+        RestRequest request = restMethod.addNewRequest(name);
+        request.setMethod(httpMethod);
+
+        // Body + media type detection
+        String mediaType = detectMediaType(req);
+        if (!mediaType.isBlank()) request.setMediaType(mediaType);
+
+        String bodyContent = readBodyContent(req);
+        if (!bodyContent.isBlank()) request.setRequestContent(bodyContent);
+
+        // Query params from URL
+        if (uri.getRawQuery() != null && !uri.getRawQuery().isEmpty()) {
+          for (String kv : uri.getRawQuery().split("&")) {
+            if (kv.isBlank()) continue;
+            String[] parts = kv.split("=", 2);
+            String k = urlDecode(parts[0]);
+            String v = parts.length > 1 ? urlDecode(parts[1]) : "";
+            if (!k.isBlank()) request.getParams().addProperty(k).setValue(v);
+          }
+        }
+
+        // Query params from Insomnia "parameters"
+        JsonNode params = req.path("parameters");
+        if (params.isArray()) {
+          params.forEach(p -> {
+            if (p.path("disabled").asBoolean(false)) return;
+            String k = p.path("name").asText("");
+            String v = p.path("value").asText("");
+            if (!k.isBlank()) {
+              if (request.getParams().getProperty(k) == null) {
+                request.getParams().addProperty(k).setValue(v);
+              } else {
+                request.getParams().getProperty(k).setValue(v);
+              }
             }
-        }
-    }
-
-    private static void handleRow(Map<String, String> row, File outDir, int rowIndex) throws Exception {
-        if (row == null) return;
-
-        String typeVal = row.get("TYPE");
-        if (typeVal == null || !typeVal.equalsIgnoreCase("Request")) return;
-
-        String dataEscaped = row.get("DATA");
-        if (dataEscaped == null || dataEscaped.isEmpty()) return;
-
-        // 1) Unescape entities to get the inner fragment
-        String fragment = unescapeXml(dataEscaped);
-
-        // 2) Repair tag soup
-        String repaired = repairFragment(fragment);
-
-        // 3) Try to parse as a normal wrapped XML
-        String wrapped = wrapXml(repaired);
-        Document doc = null;
-        boolean domOk = false;
-        try {
-            doc = parseDom(wrapped);
-            domOk = true;
-        } catch (Exception ignore) {
-            domOk = false;
+          });
         }
 
-        String dmFunc = null;
-        String appNum = null;
-
-        if (domOk) {
-            // STRICT first
-            XPath xp = XPathFactory.newInstance().newXPath();
-            dmFunc = (String) xp.evaluate(
-                "/Payload/*[local-name()='Application']/*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
-                doc, XPathConstants.STRING);
-            appNum = (String) xp.evaluate(
-                "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-                doc, XPathConstants.STRING);
-
-            dmFunc = trimOrNull(dmFunc);
-            appNum = trimOrNull(appNum);
-
-            // FALLBACK (previous robust method)
-            if (isBlank(dmFunc) || isBlank(appNum)) {
-                String dmFB = firstNonEmpty(xp, doc, new String[] {
-                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/*[local-name()='DMFunction']/text()",
-                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMfunction",
-                    "/*[local-name()='Payload']//*[local-name()='CreditRequest']/@DMFunction",
-                    "/*[local-name()='Payload']//*[local-name()='DMFunction']/text()"
-                });
-                String appFB = firstNonEmpty(xp, doc, new String[] {
-                    "/Payload/*[local-name()='Application']/*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-                    "/*[local-name()='Payload']//*[local-name()='CreditApplication']//*[local-name()='ApplicationNumber']/text()",
-                    "/*[local-name()='Payload']//*[local-name()='ApplicationNumber']/text()"
-                });
-                if (isBlank(dmFunc)) dmFunc = trimOrNull(dmFB);
-                if (isBlank(appNum)) appNum = trimOrNull(appFB);
+        // Headers
+        StringToStringsMap headersMap = new StringToStringsMap();
+        JsonNode headers = req.path("headers");
+        if (headers.isArray()) {
+          headers.forEach(h -> {
+            if (h.path("disabled").asBoolean(false)) {
+              String hn = h.path("name").asText("");
+              String hv = h.path("value").asText("");
+              if (!hn.isBlank()) headersMap.add(hn, hv);
             }
+          });
         }
-
-        // 4) If DOM still failed or metadata still missing, do regex fallback extraction (no XML parse)
-        if (!domOk || isBlank(dmFunc) || isBlank(appNum)) {
-            // Extract DMFunction (element or attribute on CreditRequest)
-            dmFunc = trimOrNull(regexDmFunction(repaired));
-            // Extract ApplicationNumber ONLY inside CreditApplication (fallback to global if needed)
-            appNum = trimOrNull(regexApplicationNumberInCreditApplication(repaired));
-            if (isBlank(appNum)) appNum = trimOrNull(regexApplicationNumberAnywhere(repaired));
+        // Ensure Content-Type aligns with mediaType if we detected it
+        if (!mediaType.isBlank()) {
+          headersMap.put("Content-Type", Collections.singletonList(mediaType));
         }
+        request.setRequestHeaders(headersMap);
+      }
+    }
 
-        if (isBlank(dmFunc) || isBlank(appNum)) {
-            System.err.println("Row " + rowIndex + ": missing DMFunction or ApplicationNumber; skipping.");
-            return;
+    project.saveAs(output.getAbsolutePath());
+    System.out.println("Wrote SoapUI project: " + output.getAbsolutePath());
+  }
+
+  /* ====================== Helpers ====================== */
+
+  private static JsonNode readInsomniaTree(File f) throws Exception {
+    // Try YAML first; if it fails, fall back to JSON
+    try (InputStream in = new FileInputStream(f)) {
+      ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
+      return yaml.readTree(in);
+    } catch (Exception yamlFail) {
+      try (InputStream in = new FileInputStream(f)) {
+        ObjectMapper json = new ObjectMapper();
+        return json.readTree(in);
+      }
+    }
+  }
+
+  private static URI safeUri(String u) {
+    if (u == null || u.isBlank()) {
+      try { return new URI("http://invalid/"); } catch (URISyntaxException e) { throw new RuntimeException(e); }
+    }
+    try {
+      return new URI(u);
+    } catch (URISyntaxException e) {
+      // Try to fix missing scheme
+      try { return new URI("http://" + u); } catch (URISyntaxException ex) {
+        try { return new URI("http://invalid/"); } catch (URISyntaxException ignored) { throw new RuntimeException(ignored); }
+      }
+    }
+  }
+
+  private static String urlDecode(String s) {
+    try { return URLDecoder.decode(s, StandardCharsets.UTF_8); }
+    catch (Exception e) { return s; }
+  }
+
+  private static String nonEmpty(String v, String def) {
+    return (v == null || v.isBlank()) ? def : v;
+  }
+
+  private static RestRequestInterface.HttpMethod httpMethodOf(String m) {
+    try { return RestRequestInterface.HttpMethod.valueOf(m.toUpperCase(Locale.ROOT)); }
+    catch (Exception e) { return RestRequestInterface.HttpMethod.GET; }
+  }
+
+  private static RestMethod findOrCreateMethod(RestResource res, RestRequestInterface.HttpMethod method) {
+    for (RestMethod rm : res.getRestMethodList()) {
+      if (rm.getMethod() == method) return rm;
+    }
+    RestMethod rm = res.addNewMethod(method.name());
+    rm.setMethod(method);
+    return rm;
+  }
+
+  private static String readBodyContent(JsonNode req) {
+    JsonNode body = req.path("body");
+    if (body.isObject()) {
+      // Insomnia bodies often: { mimeType, text, fileName, params[] (for multipart) }
+      String text = body.path("text").asText("");
+      return text == null ? "" : text;
+    } else if (body.isTextual()) {
+      return body.asText("");
+    }
+    return "";
+  }
+
+  private static String detectMediaType(JsonNode req) {
+    // prefer body.mimeType; fallback to header; else infer JSON/XML; default application/json
+    String fromBody = req.path("body").path("mimeType").asText("");
+    if (!fromBody.isBlank()) return fromBody;
+
+    String text = readBodyContent(req);
+    if (looksJson(text)) return "application/json";
+    if (looksXml(text))  return "application/xml";
+
+    // header fallback (content-type might exist)
+    JsonNode headers = req.path("headers");
+    if (headers.isArray()) {
+      for (JsonNode h : headers) {
+        if ("content-type".equalsIgnoreCase(h.path("name").asText(""))) {
+          String v = h.path("value").asText("");
+          if (!v.isBlank()) return v;
         }
-
-        // 5) Write output:
-        //    If DOM succeeded, we can keep the parsed-style wrapper; else, guarantee well-formed by CDATA.
-        String output;
-        if (domOk) {
-            output = wrapped; // already well-formed <Payload>…</Payload>
-        } else {
-            output = wrapAsCdata(repaired); // guaranteed well-formed even if inner is broken
-        }
-
-        String safeApp = sanitize(appNum);
-        String safeDM  = sanitize(dmFunc);
-        File out = new File(outDir, safeApp + "_" + safeDM + ".xml");
-        try (Writer w = new OutputStreamWriter(new FileOutputStream(out), StandardCharsets.UTF_8)) {
-            w.write(output);
-        }
-        System.out.println("Wrote: " + out.getAbsolutePath());
+      }
     }
+    return "application/json";
+  }
 
-    // -------------------- Regex fallbacks --------------------
+  private static boolean looksJson(String t) {
+    if (t == null) return false;
+    String s = t.trim();
+    return (s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"));
+  }
 
-    private static String regexDmFunction(String s) {
-        if (s == null) return null;
-
-        // 1) <DMFunction>value</DMFunction>
-        Matcher m = Pattern.compile("<\\s*DMFunction\\s*>(.*?)</\\s*DMFunction\\s*>",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
-        if (m.find()) return m.group(1).trim();
-
-        // 2) CreditRequest ... DMfunction="value"  (or DMFunction=)
-        m = Pattern.compile("<\\s*CreditRequest\\b[^>]*\\bDM[Ff]unction\\s*=\\s*\"([^\"]+)\"",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
-        if (m.find()) return m.group(1).trim();
-
-        m = Pattern.compile("<\\s*CreditRequest\\b[^>]*\\bDM[Ff]unction\\s*=\\s*'([^']+)'",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
-        if (m.find()) return m.group(1).trim();
-
-        return null;
-    }
-
-    private static String regexApplicationNumberInCreditApplication(String s) {
-        if (s == null) return null;
-
-        // Find the <CreditApplication> ... </CreditApplication> region first (most tolerant)
-        Matcher region = Pattern.compile("<\\s*CreditApplication\\b(?s).*?</\\s*CreditApplication\\s*>",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
-        if (region.find()) {
-            String scope = region.group(0);
-            Matcher m = Pattern.compile("<\\s*ApplicationNumber\\s*>(.*?)</\\s*ApplicationNumber\\s*>",
-                    Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(scope);
-            if (m.find()) return m.group(1).trim();
-        }
-        return null;
-    }
-
-    private static String regexApplicationNumberAnywhere(String s) {
-        if (s == null) return null;
-        Matcher m = Pattern.compile("<\\s*ApplicationNumber\\s*>(.*?)</\\s*ApplicationNumber\\s*>",
-                Pattern.CASE_INSENSITIVE | Pattern.DOTALL).matcher(s);
-        if (m.find()) return m.group(1).trim();
-        return null;
-    }
-
-    // -------------------- XPath helpers ---------------------
-
-    private static String firstNonEmpty(XPath xp, Document doc, String[] paths) throws Exception {
-        for (String p : paths) {
-            String v = (String) xp.evaluate(p, doc, XPathConstants.STRING);
-            if (!isBlank(v)) return v;
-        }
-        return null;
-    }
-
-    // -------------------- Parse / Repair --------------------
-
-    private static Document parseDom(String xml) throws Exception {
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        dbf.setExpandEntityReferences(false);
-        try {
-            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        } catch (Throwable ignore) {}
-        DocumentBuilder db = dbf.newDocumentBuilder();
-        return db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private static String repairFragment(String s) {
-        if (s == null) return "";
-
-        String t = s.replace("\uFEFF", "")     // BOM
-                    .replace("\u200B", "");    // zero-width space
-
-        // Keep only the XML-ish part
-        int start = t.indexOf('<');
-        int end   = t.lastIndexOf('>');
-        if (start >= 0 && end >= start) t = t.substring(start, end + 1);
-
-        // Remove inner XML declarations
-        t = t.replaceAll("<\\?xml[^>]*\\?>", "");
-
-        // Fix bare '&' (but keep valid entities)
-        t = t.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)", "&amp;");
-
-        // Ensure tags have a closing '>' — aggressively
-        t = forceAngles(t);
-
-        // Auto self-close empty start tags that are immediately followed by another tag
-        t = t.replaceAll("(<[A-Za-z_][\\w\\-.:]*[^<>]*?)>(\\s*)(?=<)", "$1/>$2");
-
-        return t.trim();
-    }
-
-    // More aggressive than before: if a '<' opens and the next '>' is missing or appears after another '<',
-    // insert a '>' right before that next '<' (or at end of string).
-    private static String forceAngles(String xml) {
-        StringBuilder out = new StringBuilder(xml.length() + 64);
-        int i = 0;
-        while (i < xml.length()) {
-            int lt = xml.indexOf('<', i);
-            if (lt < 0) { out.append(xml, i, xml.length()); break; }
-            out.append(xml, i, lt);
-            int gt = xml.indexOf('>', lt + 1);
-            int nextLt = xml.indexOf('<', lt + 1);
-
-            if (gt < 0 && nextLt < 0) {
-                // No '>' and no next '<' — close at end
-                out.append(xml, lt, xml.length()).append('>');
-                i = xml.length();
-            } else if (gt >= 0 && (nextLt < 0 || gt < nextLt)) {
-                // Normal well-formed tag or '>' before next '<'
-                out.append(xml, lt, gt + 1);
-                i = gt + 1;
-            } else {
-                // There is a next '<' before any '>' — insert a '>' just before that next '<'
-                out.append(xml, lt, nextLt).append('>');
-                i = nextLt;
-            }
-        }
-        return out.toString();
-    }
-
-    private static String wrapXml(String fragment) {
-        String cleaned = fragment == null ? "" : fragment.trim();
-        // Drop leading junk before first '<' and trailing after last '>'
-        int s = cleaned.indexOf('<'); int e = cleaned.lastIndexOf('>');
-        if (s >= 0 && e >= s) cleaned = cleaned.substring(s, e+1);
-        // Remove any inner XML decl left
-        cleaned = cleaned.replaceAll("<\\?xml[^>]*\\?>", "");
-        // Fix stray ampersands once more (safety)
-        cleaned = cleaned.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9A-Fa-f]+;)", "&amp;");
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload>\n" + cleaned + "\n</Payload>";
-        }
-
-    private static String wrapAsCdata(String fragment) {
-        String c = fragment == null ? "" : fragment.replace("]]>", "]]]]><![CDATA[>");
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Payload><![CDATA[\n" + c + "\n]]></Payload>";
-    }
-
-    // -------------------- Small utils --------------------
-
-    private static String unescapeXml(String s) {
-        return s.replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&amp;", "&")
-                .replace("&apos;", "'")
-                .replace("&quot;", "\"");
-    }
-
-    private static String sanitize(String s) {
-        return s.replaceAll("[^A-Za-z0-9._-]", "_");
-    }
-
-    private static boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
-
-    private static String trimOrNull(String s) {
-        if (s == null) return null;
-        String t = s.trim();
-        return t.isEmpty() ? null : t;
-    }
-
-    private static class InnerMeta {
-        String applicationNumber;
-        String dmFunction;
-    }
+  private static boolean looksXml(String t) {
+    if (t == null) return false;
+    String s = t.trim();
+    return s.startsWith("<") && s.endsWith(">");
+  }
 }
+
+
+
+    
