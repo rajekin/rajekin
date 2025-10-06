@@ -1,348 +1,239 @@
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
+package tools.insomnia2soapuixml;
 
-  <groupId>tools.insomnia2soapui</groupId>
-  <artifactId>insomnia2soapui</artifactId>
-  <version>1.0.0</version>
-
-  <properties>
-    <maven.compiler.source>11</maven.compiler.source>
-    <maven.compiler.target>11</maven.compiler.target>
-    <jackson.version>2.17.1</jackson.version>
-    <soapui.version>5.7.0</soapui.version>
-  </properties>
-
-  <dependencies>
-    <!-- Jackson (JSON + YAML) -->
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-core</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-annotations</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>com.fasterxml.jackson.dataformat</groupId>
-      <artifactId>jackson-dataformat-yaml</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
-
-    <!-- SoapUI OSS (project/model APIs) -->
-    <dependency>
-      <groupId>org.soapui</groupId>
-      <artifactId>soapui</artifactId>
-      <version>${soapui.version}</version>
-    </dependency>
-  </dependencies>
-
-  <build>
-    <plugins>
-      <!-- Build an executable jar with dependencies for easy running -->
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-assembly-plugin</artifactId>
-        <version>3.6.0</version>
-        <configuration>
-          <archive>
-            <manifest>
-              <mainClass>tools.insomnia2soapui.InsomniaToSoapUI</mainClass>
-            </manifest>
-          </archive>
-          <descriptorRefs>
-            <descriptorRef>jar-with-dependencies</descriptorRef>
-          </descriptorRefs>
-        </configuration>
-        <executions>
-          <execution>
-            <id>make-assembly</id>
-            <phase>package</phase>
-            <goals><goal>single</goal></goals>
-          </execution>
-        </executions>
-      </plugin>
-    </plugins>
-  </build>
-</project>
-
-package tools.insomnia2soapui;
-
-import com.eviware.soapui.impl.rest.RestMethod;
-import com.eviware.soapui.impl.rest.RestRequest;
-import com.eviware.soapui.impl.rest.RestRequestInterface;
-import com.eviware.soapui.impl.rest.RestResource;
-import com.eviware.soapui.impl.rest.RestService;
-import com.eviware.soapui.impl.rest.RestServiceFactory;
-import com.eviware.soapui.impl.wsdl.WsdlProject;
-import com.eviware.soapui.support.types.StringToStringsMap;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
+import javax.xml.stream.XMLOutputFactory;
+import javax.xml.stream.XMLStreamWriter;
+import java.io.*;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-/**
- * Insomnia v5+ export (YAML or JSON) -> SoapUI REST project (.xml).
- *
- * Usage:
- *   java -jar insomnia2soapui-1.0.0-jar-with-dependencies.jar export.yaml SoapUI-Project.xml
- */
-public class InsomniaToSoapUI {
+public class InsomniaToSoapUiXml {
+
+  private static final String NS_CON = "http://eviware.com/soapui/config";
+  private static final String NS_XSI = "http://www.w3.org/2001/XMLSchema-instance";
 
   public static void main(String[] args) throws Exception {
     if (args.length < 2) {
-      System.err.println("Usage: java -jar insomnia2soapui-<ver>-jar-with-dependencies.jar <insomnia-export.(yaml|yml|json)> <output-soapui-project.xml>");
+      System.err.println("Usage: java -jar insomnia2soapui-xml-1.0.0-jar-with-dependencies.jar <insomnia.(yaml|yml|json)> <SoapUI-Project.xml>");
       System.exit(1);
     }
     File input = new File(args[0]);
     File output = new File(args[1]);
 
-    JsonNode root = readInsomniaTree(input);
-
-    // Insomnia collections generally have top-level "resources" containing objects with _type == "request"
+    JsonNode root = readInsomnia(input);
     JsonNode resources = root.path("resources");
     if (!resources.isArray()) {
-      throw new IllegalArgumentException("Not an Insomnia v5+ export: missing top-level 'resources' array.");
+      throw new IllegalArgumentException("Expected Insomnia v5+ export with top-level 'resources' array.");
     }
 
-    // Collect requests
     List<JsonNode> requests = new ArrayList<>();
     for (JsonNode r : resources) {
-      if ("request".equalsIgnoreCase(r.path("_type").asText())) {
-        requests.add(r);
-      }
+      if ("request".equalsIgnoreCase(r.path("_type").asText())) requests.add(r);
     }
     if (requests.isEmpty()) {
-      System.out.println("No requests found in the Insomnia export.");
+      System.out.println("No requests found.");
       return;
     }
 
-    // Group by base endpoint (scheme://host[:port]) -> one RestService per host
+    // Group requests by base host
     Map<String, List<JsonNode>> byHost = new LinkedHashMap<>();
-    for (JsonNode req : requests) {
-      String u = req.path("url").asText("");
-      URI uri = safeUri(u);
+    for (JsonNode r : requests) {
+      URI uri = safeUri(r.path("url").asText(""));
       String hostKey = (uri.getScheme() == null ? "http" : uri.getScheme()) + "://" + (uri.getHost() == null ? "invalid" : uri.getHost());
       if (uri.getPort() > 0) hostKey += ":" + uri.getPort();
-      byHost.computeIfAbsent(hostKey, k -> new ArrayList<>()).add(req);
+      byHost.computeIfAbsent(hostKey, k -> new ArrayList<>()).add(r);
     }
 
-    // Create SoapUI project
-    WsdlProject project = new WsdlProject();
-    String projectName = root.path("name").asText("");
-    project.setName(projectName.isBlank() ? "Imported from Insomnia" : projectName);
+    // Write SoapUI project XML
+    try (OutputStream fos = new FileOutputStream(output)) {
+      XMLOutputFactory f = XMLOutputFactory.newInstance();
+      XMLStreamWriter x = f.createXMLStreamWriter(new OutputStreamWriter(fos, StandardCharsets.UTF_8));
 
-    int serviceIndex = 1;
-    for (Map.Entry<String, List<JsonNode>> entry : byHost.entrySet()) {
-      String baseEndpoint = entry.getKey();
-      String serviceName = "Service " + serviceIndex++ + " - " + baseEndpoint;
+      x.writeStartDocument("UTF-8", "1.0");
+      x.setDefaultNamespace(NS_CON);
+      x.writeStartElement("con", "soapui-project", NS_CON);
+      x.writeNamespace("con", NS_CON);
+      x.writeNamespace("xsi", NS_XSI);
+      attr(x, "id", uuid());
+      attr(x, "activeEnvironment", "Default");
+      attr(x, "name", defaultStr(root.path("name").asText(""), "Imported from Insomnia"));
+      attr(x, "resourceRoot", "");
+      attr(x, "soapui-version", "5.7.0");
+      attr(x, "abortOnError", "false");
+      attr(x, "runType", "SEQUENTIAL");
 
-      RestService service = (RestService) project.addNewInterface(serviceName, RestServiceFactory.REST_TYPE);
-      service.addNewEndpoint(baseEndpoint);
+      // <con:settings/>
+      elemEmpty(x, "settings");
 
-      // Resource cache per path
-      Map<String, RestResource> resourceMap = new LinkedHashMap<>();
+      int serviceIndex = 1;
+      for (Map.Entry<String, List<JsonNode>> entry : byHost.entrySet()) {
+        String endpoint = entry.getKey();
+        // <con:interface xsi:type="con:RestService" ...>
+        x.writeStartElement(NS_CON, "interface");
+        x.writeAttribute("xmlns:xsi", NS_XSI);
+        x.writeAttribute("xsi:type", "con:RestService");
+        attr(x, "id", uuid());
+        attr(x, "wadlVersion", "http://wadl.dev.java.net/2009/02");
+        attr(x, "name", endpoint);
+        attr(x, "type", "rest");
 
-      // stable order
-      List<JsonNode> hostRequests = new ArrayList<>(entry.getValue());
-      hostRequests.sort(Comparator.comparing(n -> n.path("name").asText("")));
+        elemEmpty(x, "settings");
 
-      int reqCounter = 1;
-      for (JsonNode req : hostRequests) {
-        String name = nonEmpty(req.path("name").asText(""), "Request " + reqCounter++);
-        String methodStr = nonEmpty(req.path("method").asText(""), "GET");
-        RestRequestInterface.HttpMethod httpMethod = httpMethodOf(methodStr);
+        // <con:definitionCache type="TEXT" rootPart=""/>
+        x.writeStartElement(NS_CON, "definitionCache");
+        attr(x, "type", "TEXT");
+        attr(x, "rootPart", "");
+        x.writeEndElement();
 
-        URI uri = safeUri(req.path("url").asText(""));
-        String path = nonEmpty(uri.getRawPath(), "/");
+        // <con:endpoints><con:endpoint>...</con:endpoint></con:endpoints>
+        x.writeStartElement(NS_CON, "endpoints");
+        textElem(x, "endpoint", endpoint);
+        x.writeEndElement();
 
-        // Make/find resource by path
-        RestResource resource = resourceMap.computeIfAbsent(path, p -> {
-          String display = p.startsWith("/") ? p.substring(1) : p;
-          return service.addNewResource(display.isBlank() ? "/" : display, p.isBlank() ? "/" : p);
-        });
+        // Prepare resource map by path
+        Map<String, List<JsonNode>> byPath = new LinkedHashMap<>();
+        for (JsonNode r : entry.getValue()) {
+          URI uri = safeUri(r.path("url").asText(""));
+          String path = defaultStr(uri.getRawPath(), "/");
+          byPath.computeIfAbsent(path, k -> new ArrayList<>()).add(r);
+        }
 
-        // Reuse or create a RestMethod for this HTTP verb under the resource
-        RestMethod restMethod = findOrCreateMethod(resource, httpMethod);
+        for (Map.Entry<String, List<JsonNode>> pathEntry : byPath.entrySet()) {
+          String path = pathEntry.getKey();
+          String resourceId = uuid();
 
-        // Create a request under the method
-        RestRequest request = restMethod.addNewRequest(name);
-        request.setMethod(httpMethod);
+          x.writeStartElement(NS_CON, "resource");
+          attr(x, "name", displayName(path));
+          attr(x, "path", path);
+          attr(x, "id", resourceId);
+          elemEmpty(x, "settings");
+          elemEmpty(x, "parameters");
 
-        // Body + media type detection
-        String mediaType = detectMediaType(req);
-        if (!mediaType.isBlank()) request.setMediaType(mediaType);
-
-        String bodyContent = readBodyContent(req);
-        if (!bodyContent.isBlank()) request.setRequestContent(bodyContent);
-
-        // Query params from URL
-        if (uri.getRawQuery() != null && !uri.getRawQuery().isEmpty()) {
-          for (String kv : uri.getRawQuery().split("&")) {
-            if (kv.isBlank()) continue;
-            String[] parts = kv.split("=", 2);
-            String k = urlDecode(parts[0]);
-            String v = parts.length > 1 ? urlDecode(parts[1]) : "";
-            if (!k.isBlank()) request.getParams().addProperty(k).setValue(v);
+          // group by HTTP method
+          Map<String, List<JsonNode>> byVerb = new LinkedHashMap<>();
+          for (JsonNode r : pathEntry.getValue()) {
+            String verb = defaultStr(r.path("method").asText(""), "GET").toUpperCase(Locale.ROOT);
+            byVerb.computeIfAbsent(verb, k -> new ArrayList<>()).add(r);
           }
+
+          for (Map.Entry<String, List<JsonNode>> verbEntry : byVerb.entrySet()) {
+            String verb = verbEntry.getKey();
+            x.writeStartElement(NS_CON, "method");
+            attr(x, "name", verb);           // SoapUI will show e.g. "GET"
+            attr(x, "id", uuid());
+            attr(x, "method", verb);
+            elemEmpty(x, "settings");
+            elemEmpty(x, "parameters");
+
+            // Optional representation block (kept minimal)
+            x.writeStartElement(NS_CON, "representation");
+            attr(x, "type", "RESPONSE");
+            textElem(x, "mediaType", "application/json");
+            textElem(x, "status", "200");
+            elemEmpty(x, "params");
+            // element tag is optional; leave out
+            x.writeEndElement(); // representation
+
+            // Requests under the method
+            for (JsonNode req : verbEntry.getValue()) {
+              String reqName = defaultStr(req.path("name").asText(""), verb + " " + path);
+              URI uri = safeUri(req.path("url").asText(""));
+              String mediaType = detectMediaType(req);
+              String body = readBody(req);
+
+              x.writeStartElement(NS_CON, "request");
+              attr(x, "name", reqName);
+              attr(x, "id", uuid());
+              if (!mediaType.isBlank()) attr(x, "mediaType", mediaType);
+
+              // <con:settings> with request headers fragment
+              x.writeStartElement(NS_CON, "settings");
+              String headersFragment = buildHeadersXmlFragment(req);
+              x.writeStartElement(NS_CON, "setting");
+              attr(x, "id", "com.eviware.soapui.impl.wsdl.WsdlRequest@request-headers");
+              // value must be XML-escaped; SoapUI expects <xml-fragment...>…</xml-fragment>
+              x.writeCharacters(headersFragment);
+              x.writeEndElement(); // setting
+              x.writeEndElement(); // settings
+
+              textElem(x, "endpoint", endpoint);
+
+              // body (may be empty)
+              x.writeStartElement(NS_CON, "request");
+              if (!body.isBlank()) x.writeCData(body);
+              x.writeEndElement();
+
+              // originalUri with query params intact so SoapUI shows them in Params
+              textElem(x, "originalUri", uri.toString());
+
+              // No authorization by default
+              x.writeStartElement(NS_CON, "credentials");
+              textElem(x, "authType", "No Authorization");
+              x.writeEndElement();
+
+              // JMS & params shells (optional)
+              x.writeEmptyElement(NS_CON, "jmsConfig");
+              x.writeAttribute("JMSDeliveryMode", "PERSISTENT");
+              elemEmpty(x, "jmsPropertyConfig");
+              elemEmpty(x, "parameters");
+
+              x.writeEndElement(); // request
+            }
+
+            x.writeEndElement(); // method
+          }
+
+          x.writeEndElement(); // resource
         }
 
-        // Query params from Insomnia "parameters"
-        JsonNode params = req.path("parameters");
-        if (params.isArray()) {
-          params.forEach(p -> {
-            if (p.path("disabled").asBoolean(false)) return;
-            String k = p.path("name").asText("");
-            String v = p.path("value").asText("");
-            if (!k.isBlank()) {
-              if (request.getParams().getProperty(k) == null) {
-                request.getParams().addProperty(k).setValue(v);
-              } else {
-                request.getParams().getProperty(k).setValue(v);
-              }
-            }
-          });
-        }
-
-        // Headers
-        StringToStringsMap headersMap = new StringToStringsMap();
-        JsonNode headers = req.path("headers");
-        if (headers.isArray()) {
-          headers.forEach(h -> {
-            if (h.path("disabled").asBoolean(false)) {
-              String hn = h.path("name").asText("");
-              String hv = h.path("value").asText("");
-              if (!hn.isBlank()) headersMap.add(hn, hv);
-            }
-          });
-        }
-        // Ensure Content-Type aligns with mediaType if we detected it
-        if (!mediaType.isBlank()) {
-          headersMap.put("Content-Type", Collections.singletonList(mediaType));
-        }
-        request.setRequestHeaders(headersMap);
+        x.writeEndElement(); // interface
       }
+
+      // minimal containers expected by many projects
+      elemEmpty(x, "properties");
+      elemEmpty(x, "wssContainer");
+      elemEmpty(x, "oAuth2ProfileContainer");
+      elemEmpty(x, "oAuth1ProfileContainer");
+
+      x.writeEndElement(); // soapui-project
+      x.writeEndDocument();
+      x.flush();
     }
 
-    project.saveAs(output.getAbsolutePath());
     System.out.println("Wrote SoapUI project: " + output.getAbsolutePath());
   }
 
-  /* ====================== Helpers ====================== */
+  /* --------------- helpers --------------- */
 
-  private static JsonNode readInsomniaTree(File f) throws Exception {
-    // Try YAML first; if it fails, fall back to JSON
+  private static JsonNode readInsomnia(File f) throws IOException {
     try (InputStream in = new FileInputStream(f)) {
-      ObjectMapper yaml = new ObjectMapper(new YAMLFactory());
-      return yaml.readTree(in);
-    } catch (Exception yamlFail) {
+      return new ObjectMapper(new YAMLFactory()).readTree(in);
+    } catch (Exception notYaml) {
       try (InputStream in = new FileInputStream(f)) {
-        ObjectMapper json = new ObjectMapper();
-        return json.readTree(in);
+        return new ObjectMapper().readTree(in);
       }
     }
   }
 
-  private static URI safeUri(String u) {
-    if (u == null || u.isBlank()) {
-      try { return new URI("http://invalid/"); } catch (URISyntaxException e) { throw new RuntimeException(e); }
-    }
-    try {
-      return new URI(u);
-    } catch (URISyntaxException e) {
-      // Try to fix missing scheme
-      try { return new URI("http://" + u); } catch (URISyntaxException ex) {
-        try { return new URI("http://invalid/"); } catch (URISyntaxException ignored) { throw new RuntimeException(ignored); }
-      }
-    }
+  private static String uuid() { return java.util.UUID.randomUUID().toString(); }
+
+  private static void attr(XMLStreamWriter x, String name, String value) throws Exception {
+    x.writeAttribute(name, value);
   }
 
-  private static String urlDecode(String s) {
-    try { return URLDecoder.decode(s, StandardCharsets.UTF_8); }
-    catch (Exception e) { return s; }
+  private static void elemEmpty(XMLStreamWriter x, String local) throws Exception {
+    x.writeEmptyElement(NS_CON, local);
   }
 
-  private static String nonEmpty(String v, String def) {
-    return (v == null || v.isBlank()) ? def : v;
+  private static void textElem(XMLStreamWriter x, String local, String text) throws Exception {
+    x.writeStartElement(NS_CON, local);
+    x.writeCharacters(text == null ? "" : text);
+    x.writeEndElement();
   }
 
-  private static RestRequestInterface.HttpMethod httpMethodOf(String m) {
-    try { return RestRequestInterface.HttpMethod.valueOf(m.toUpperCase(Locale.ROOT)); }
-    catch (Exception e) { return RestRequestInterface.HttpMethod.GET; }
-  }
-
-  private static RestMethod findOrCreateMethod(RestResource res, RestRequestInterface.HttpMethod method) {
-    for (RestMethod rm : res.getRestMethodList()) {
-      if (rm.getMethod() == method) return rm;
-    }
-    RestMethod rm = res.addNewMethod(method.name());
-    rm.setMethod(method);
-    return rm;
-  }
-
-  private static String readBodyContent(JsonNode req) {
-    JsonNode body = req.path("body");
-    if (body.isObject()) {
-      // Insomnia bodies often: { mimeType, text, fileName, params[] (for multipart) }
-      String text = body.path("text").asText("");
-      return text == null ? "" : text;
-    } else if (body.isTextual()) {
-      return body.asText("");
-    }
-    return "";
-  }
-
-  private static String detectMediaType(JsonNode req) {
-    // prefer body.mimeType; fallback to header; else infer JSON/XML; default application/json
-    String fromBody = req.path("body").path("mimeType").asText("");
-    if (!fromBody.isBlank()) return fromBody;
-
-    String text = readBodyContent(req);
-    if (looksJson(text)) return "application/json";
-    if (looksXml(text))  return "application/xml";
-
-    // header fallback (content-type might exist)
-    JsonNode headers = req.path("headers");
-    if (headers.isArray()) {
-      for (JsonNode h : headers) {
-        if ("content-type".equalsIgnoreCase(h.path("name").asText(""))) {
-          String v = h.path("value").asText("");
-          if (!v.isBlank()) return v;
-        }
-      }
-    }
-    return "application/json";
-  }
-
-  private static boolean looksJson(String t) {
-    if (t == null) return false;
-    String s = t.trim();
-    return (s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"));
-  }
-
-  private static boolean looksXml(String t) {
-    if (t == null) return false;
-    String s = t.trim();
-    return s.startsWith("<") && s.endsWith(">");
-  }
-}
-
-
-
-    
+  private static String di
