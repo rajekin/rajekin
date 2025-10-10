@@ -1,378 +1,369 @@
-package tools.insomnia2soapuixml;
+package com.raj.utilities.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.fasterxml.jackson.databind.node.*;
+import org.w3c.dom.*;
 
-import javax.xml.stream.XMLOutputFactory;
-import javax.xml.stream.XMLStreamWriter;
-import java.io.*;
-import java.net.URI;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.regex.Pattern;
 
-public class InsomniaToSoapUiXml {
+public class XmlToJsonService {
 
-  /* ====== Namespaces ====== */
-  private static final String NS_CON = "http://eviware.com/soapui/config";
-  private static final String NS_XSI = "http://www.w3.org/2001/XMLSchema-instance";
+    private static final String ATTR_PREFIX = "@";
+    private static final String TEXT_KEY = "#text";
 
-  public static void main(String[] args) throws Exception {
-    if (args.length < 2) {
-      System.err.println("Usage: java -jar insomnia2soapui-xml-1.0.0-jar-with-dependencies.jar <insomnia.(yaml|yml|json)> <SoapUI-Project.xml>");
-      System.exit(1);
-    }
-    File input = new File(args[0]);
-    File output = new File(args[1]);
+    private final ObjectMapper mapper = new ObjectMapper();
 
-    JsonNode root = readInsomnia(input);
-    List<JsonNode> requests = extractRequests(root);
-    if (requests.isEmpty()) {
-      throw new IllegalArgumentException("No request nodes found. Supported: top-level 'resources[]', or 'collections[]/children[]' trees, or any node with 'url'.");
-    }
+    public static final class ConversionResult {
+        public final String prettyJson;
+        public final int xmlAttributeCount;
+        public final int jsonAttributeCount;
+        public final boolean allAttributesConverted;
+        public final List<String> missingAttributes; // XPath-like of any missed attributes (should be empty)
 
-    // Group by base endpoint scheme://host[:port]
-    Map<String, List<JsonNode>> byHost = new LinkedHashMap<>();
-    for (JsonNode r : requests) {
-      String rawUrl = r.path("url").asText("");
-      URI uri = parseUriFromInsomniaUrl(rawUrl);
-      String hostKey = ((uri.getScheme() == null) ? "http" : uri.getScheme()) + "://" + ((uri.getHost() == null) ? "invalid" : uri.getHost());
-      if (uri.getPort() > 0) hostKey += ":" + uri.getPort();
-      byHost.computeIfAbsent(hostKey, k -> new ArrayList<>()).add(r);
+        public ConversionResult(String prettyJson, int xmlAttributeCount, int jsonAttributeCount,
+                                boolean allAttributesConverted, List<String> missingAttributes) {
+            this.prettyJson = prettyJson;
+            this.xmlAttributeCount = xmlAttributeCount;
+            this.jsonAttributeCount = jsonAttributeCount;
+            this.allAttributesConverted = allAttributesConverted;
+            this.missingAttributes = missingAttributes;
+        }
     }
 
-    // Write SoapUI project XML
-    try (OutputStream fos = new FileOutputStream(output);
-         OutputStreamWriter osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
-      XMLOutputFactory f = XMLOutputFactory.newInstance();
-      XMLStreamWriter x = f.createXMLStreamWriter(osw);
-
-      x.writeStartDocument("UTF-8", "1.0");
-      x.setDefaultNamespace(NS_CON);
-      x.writeStartElement("con", "soapui-project", NS_CON);
-      x.writeNamespace("con", NS_CON);
-      x.writeNamespace("xsi", NS_XSI);
-
-      attr(x, "id", uuid());
-      attr(x, "activeEnvironment", "Default");
-      attr(x, "name", defaultStr(root.path("name").asText(""), "Imported from Insomnia"));
-      attr(x, "resourceRoot", "");
-      attr(x, "soapui-version", "5.7.0");
-      attr(x, "abortOnError", "false");
-      attr(x, "runType", "SEQUENTIAL");
-
-      elemEmpty(x, "settings");
-
-      // Interfaces (one per host)
-      for (Map.Entry<String, List<JsonNode>> entry : byHost.entrySet()) {
-        String endpoint = entry.getKey();
-
-        x.writeStartElement(NS_CON, "interface");
-        x.writeAttribute("xmlns:xsi", NS_XSI);
-        x.writeAttribute("xsi:type", "con:RestService");
-        attr(x, "id", uuid());
-        attr(x, "wadlVersion", "http://wadl.dev.java.net/2009/02");
-        attr(x, "name", endpoint);
-        attr(x, "type", "rest");
-
-        elemEmpty(x, "settings");
-
-        x.writeStartElement(NS_CON, "definitionCache");
-        attr(x, "type", "TEXT");
-        attr(x, "rootPart", "");
-        x.writeEndElement();
-
-        x.writeStartElement(NS_CON, "endpoints");
-        textElem(x, "endpoint", endpoint);
-        x.writeEndElement();
-
-        // Group by path under this host
-        Map<String, List<JsonNode>> byPath = new LinkedHashMap<>();
-        for (JsonNode r : entry.getValue()) {
-          URI uri = parseUriFromInsomniaUrl(r.path("url").asText(""));
-          String path = defaultStr(uri.getRawPath(), "/");
-          byPath.computeIfAbsent(path, k -> new ArrayList<>()).add(r);
+    public ConversionResult convert(String xml, boolean unwrapSoapBody) throws Exception {
+        if (xml == null || xml.isBlank()) {
+            throw new IllegalArgumentException("XML input is empty.");
         }
 
-        for (Map.Entry<String, List<JsonNode>> pathEntry : byPath.entrySet()) {
-          String path = pathEntry.getKey();
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        dbf.setNamespaceAware(true);
+        // Safe XML parsing guards
+        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        dbf.setXIncludeAware(false);
+        dbf.setExpandEntityReferences(false);
 
-          x.writeStartElement(NS_CON, "resource");
-          attr(x, "name", displayName(path));
-          attr(x, "path", path);
-          attr(x, "id", uuid());
+        DocumentBuilder db = dbf.newDocumentBuilder();
+        Document doc = db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+        doc.getDocumentElement().normalize();
 
-          elemEmpty(x, "settings");
-          elemEmpty(x, "parameters");
-
-          // Group by HTTP verb
-          Map<String, List<JsonNode>> byVerb = new LinkedHashMap<>();
-          for (JsonNode r : pathEntry.getValue()) {
-            String verb = defaultStr(r.path("method").asText(""), "GET").toUpperCase(Locale.ROOT);
-            byVerb.computeIfAbsent(verb, k -> new ArrayList<>()).add(r);
-          }
-
-          for (Map.Entry<String, List<JsonNode>> verbEntry : byVerb.entrySet()) {
-            String verb = verbEntry.getKey();
-
-            x.writeStartElement(NS_CON, "method");
-            attr(x, "name", verb);
-            attr(x, "id", uuid());
-            attr(x, "method", verb);
-
-            elemEmpty(x, "settings");
-            elemEmpty(x, "parameters");
-
-            // Minimal representation (optional)
-            x.writeStartElement(NS_CON, "representation");
-            attr(x, "type", "RESPONSE");
-            textElem(x, "mediaType", "application/json");
-            textElem(x, "status", "200");
-            elemEmpty(x, "params");
-            x.writeEndElement(); // representation
-
-            // Requests
-            for (JsonNode req : verbEntry.getValue()) {
-              String reqName = defaultStr(req.path("name").asText(""), verb + " " + path);
-              URI uri = parseUriFromInsomniaUrl(req.path("url").asText(""));
-              String mediaType = detectMediaType(req);
-              String body = cleanupBody(readBody(req));
-
-              x.writeStartElement(NS_CON, "request");
-              attr(x, "name", reqName);
-              attr(x, "id", uuid());
-              if (!mediaType.isBlank()) attr(x, "mediaType", mediaType);
-
-              // headers in settings as SoapUI's request-headers xml-fragment
-              x.writeStartElement(NS_CON, "settings");
-              x.writeStartElement(NS_CON, "setting");
-              attr(x, "id", "com.eviware.soapui.impl.wsdl.WsdlRequest@request-headers");
-              x.writeCharacters(buildHeadersXmlFragment(req)); // already escaped
-              x.writeEndElement(); // setting
-              x.writeEndElement(); // settings
-
-              textElem(x, "endpoint", endpoint);
-
-              x.writeStartElement(NS_CON, "request");
-              if (!body.isBlank()) x.writeCData(body);
-              x.writeEndElement(); // request body
-
-              // keep original URL (with query) so SoapUI shows Params tab populated
-              textElem(x, "originalUri", uri.toString());
-
-              // No auth by default
-              x.writeStartElement(NS_CON, "credentials");
-              textElem(x, "authType", "No Authorization");
-              x.writeEndElement();
-
-              // Stubs required by many project files
-              x.writeEmptyElement(NS_CON, "jmsConfig");
-              x.writeAttribute("JMSDeliveryMode", "PERSISTENT");
-              elemEmpty(x, "jmsPropertyConfig");
-              elemEmpty(x, "parameters");
-
-              x.writeEndElement(); // request
+        Element start = doc.getDocumentElement();
+        if (unwrapSoapBody) {
+            Element maybeEnvelope = start;
+            if (localName(maybeEnvelope).equalsIgnoreCase("Envelope")) {
+                Optional<Element> body = firstChildElementByLocalName(maybeEnvelope, "Body");
+                if (body.isPresent()) {
+                    Optional<Element> firstPayload = firstElementChild(body.get());
+                    if (firstPayload.isPresent()) {
+                        start = firstPayload.get();
+                    } else {
+                        start = body.get();
+                    }
+                }
             }
-
-            x.writeEndElement(); // method
-          }
-
-          x.writeEndElement(); // resource
         }
 
-        x.writeEndElement(); // interface
-      }
+        Set<String> xmlAttrPaths = new LinkedHashSet<>();
+        Set<String> jsonAttrPaths = new LinkedHashSet<>();
 
-      // minimal containers
-      elemEmpty(x, "properties");
-      elemEmpty(x, "wssContainer");
-      elemEmpty(x, "oAuth2ProfileContainer");
-      elemEmpty(x, "oAuth1ProfileContainer");
+        ObjectNode root = mapper.createObjectNode();
+        root.set(localName(start), elementToJson(start, mapper.createObjectNode(), "/" + localName(start), xmlAttrPaths, jsonAttrPaths));
 
-      x.writeEndElement(); // soapui-project
-      x.writeEndDocument();
-      x.flush();
-    }
+        // Pretty JSON
+        String pretty = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(root);
 
-    System.out.println("Wrote SoapUI project: " + output.getAbsolutePath());
-  }
+        // Verification
+        int xmlAttrCount = xmlAttrPaths.size();
+        int jsonAttrCount = jsonAttrPaths.size();
 
-  /* ================= Helpers ================= */
-
-  /** Reads YAML first; if that fails, falls back to JSON. */
-  private static JsonNode readInsomnia(File f) throws IOException {
-    byte[] bytes = java.nio.file.Files.readAllBytes(f.toPath());
-    try {
-      JsonNode n = new ObjectMapper(new YAMLFactory()).readTree(bytes);
-      System.out.println("Parsed input as YAML.");
-      return n;
-    } catch (Throwable yamlErr) {
-      System.err.println("YAML parse failed (" + yamlErr.getClass().getSimpleName() + "): " + yamlErr.getMessage());
-      System.out.println("Falling back to JSON…");
-      return new ObjectMapper().readTree(bytes);
-    }
-  }
-
-  /** Supports classic `resources[]`, tree-style `type/children`, and Insomnia `collections[]/children[]`. */
-  private static List<JsonNode> extractRequests(JsonNode root) {
-    List<JsonNode> out = new ArrayList<>();
-
-    // Case A: resources[]
-    JsonNode resources = root.path("resources");
-    if (resources.isArray()) {
-      for (JsonNode r : resources) if (isRequestNode(r)) out.add(r);
-      if (!out.isEmpty()) return out;
-    }
-
-    // Case B: collections[] trees
-    JsonNode cols = root.path("collections");
-    if (cols.isArray()) {
-      for (JsonNode c : cols) collectFromChildren(c, out);
-      if (!out.isEmpty()) return out;
-    }
-
-    // Case C: generic type/children anywhere
-    collectFromChildren(root, out);
-    return out;
-  }
-
-  private static void collectFromChildren(JsonNode node, List<JsonNode> out) {
-    Deque<JsonNode> stack = new ArrayDeque<>();
-    stack.push(node);
-    while (!stack.isEmpty()) {
-      JsonNode n = stack.pop();
-      if (isRequestNode(n)) out.add(n);
-      JsonNode kids = n.path("children");
-      if (kids.isArray()) kids.forEach(stack::push);
-    }
-  }
-
-  private static boolean isRequestNode(JsonNode n) {
-    String t1 = n.path("_type").asText("");
-    String t2 = n.path("type").asText("");
-    if ("request".equalsIgnoreCase(t1) || "request".equalsIgnoreCase(t2)) return true;
-    // Heuristic: leaf with URL (Insomnia YAML often uses no explicit type on leaves)
-    return n.has("url");
-  }
-
-  /** Insomnia URLs can contain {{variables}}. Replace them with placeholders so URI parsing succeeds. */
-  private static URI parseUriFromInsomniaUrl(String raw) {
-    if (raw == null || raw.isBlank()) return URI.create("http://invalid/");
-    String s = raw.trim();
-
-    // If starts with http(s)://{{...}}/path → replace {{...}} with "env"
-    s = s.replaceAll("(?i)^(https?://)\\s*\\{\\{[^}]+}}", "$1env");
-    // Replace any remaining {{...}} with "env" (safe placeholder)
-    s = s.replaceAll("\\{\\{[^}]+}}", "env");
-
-    // Remove accidental spaces inside scheme or after slashes
-    s = s.replaceAll("(?i)^(https?)\\s*://", "$1://");
-
-    try { return URI.create(s); }
-    catch (Exception ignore) { return URI.create("http://invalid/"); }
-  }
-
-  private static String detectMediaType(JsonNode req) {
-    String mt = req.path("body").path("mimeType").asText("");
-    if (!mt.isBlank()) return mt;
-
-    String t = readBody(req).trim();
-    if ((t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))) return "application/json";
-    if (t.startsWith("<") && t.endsWith(">")) return "application/xml";
-
-    // header fallback
-    JsonNode headers = req.path("headers");
-    if (headers.isArray()) {
-      for (JsonNode h : headers) {
-        if ("content-type".equalsIgnoreCase(h.path("name").asText(""))) {
-          String v = h.path("value").asText("");
-          if (!v.isBlank()) return v;
+        // Any attribute in XML that didn't show under our JSON ATTR_PREFIX is considered missing
+        List<String> missing = new ArrayList<>();
+        for (String p : xmlAttrPaths) {
+            if (!jsonAttrPaths.contains(p)) {
+                missing.add(p);
+            }
         }
-      }
-    } else if (headers.isObject()) {
-      // headers as map
-      JsonNode ct = headers.get("Content-Type");
-      if (ct == null) ct = headers.get("content-type");
-      if (ct != null && ct.isTextual() && !ct.asText().isBlank()) return ct.asText();
-    }
-    return "application/json";
-  }
 
-  private static String readBody(JsonNode req) {
-    JsonNode b = req.path("body");
-    if (b.isObject()) return b.path("text").asText("");
-    if (b.isTextual()) return b.asText("");
-    return "";
-  }
+        boolean allConverted = missing.isEmpty() && xmlAttrCount == jsonAttrCount;
 
-  /** Remove lines that are just "\" (common in quoted YAML dumps) and trim trailing whitespace. */
-  private static String cleanupBody(String body) {
-    if (body == null) return "";
-    String cleaned = Pattern.compile("(?m)^\\\\\\s*$").matcher(body).replaceAll(""); // drop lines that are only "\"
-    return cleaned.trim();
-  }
-
-  private static String defaultStr(String value, String fallback) {
-    return (value == null || value.isBlank()) ? fallback : value;
-  }
-
-  private static String uuid() { return java.util.UUID.randomUUID().toString(); }
-
-  private static void attr(XMLStreamWriter x, String name, String value) throws Exception {
-    x.writeAttribute(name, value);
-  }
-
-  private static void elemEmpty(XMLStreamWriter x, String local) throws Exception {
-    x.writeEmptyElement(NS_CON, local);
-  }
-
-  private static void textElem(XMLStreamWriter x, String local, String text) throws Exception {
-    x.writeStartElement(NS_CON, local);
-    x.writeCharacters(text == null ? "" : text);
-    x.writeEndElement();
-  }
-
-  private static String displayName(String path) {
-    if (path == null || path.isBlank() || "/".equals(path)) return "/";
-    return path.startsWith("/") ? path.substring(1) : path;
-  }
-
-  /** SoapUI stores request headers in a `request-headers` XML fragment setting. Supports list OR map. */
-  private static String buildHeadersXmlFragment(JsonNode req) {
-    StringBuilder sb = new StringBuilder();
-    sb.append("<xml-fragment xmlns:con=\"").append(NS_CON).append("\">");
-
-    JsonNode headers = req.path("headers");
-    if (headers.isArray()) {
-      for (JsonNode h : headers) {
-        if (h.path("disabled").asBoolean(false)) continue;
-        String name = h.path("name").asText("");
-        String value = h.path("value").asText("");
-        if (name.isBlank()) continue;
-        sb.append("<con:entry key=\"").append(escapeXmlAttr(name))
-          .append("\" value=\"").append(escapeXmlAttr(value)).append("\"/>");
-      }
-    } else if (headers.isObject()) {
-      Iterator<String> it = headers.fieldNames();
-      while (it.hasNext()) {
-        String name = it.next();
-        JsonNode v = headers.get(name);
-        String value = v == null ? "" : v.asText("");
-        if (name == null || name.isBlank()) continue;
-        sb.append("<con:entry key=\"").append(escapeXmlAttr(name))
-          .append("\" value=\"").append(escapeXmlAttr(value)).append("\"/>");
-      }
+        return new ConversionResult(pretty, xmlAttrCount, jsonAttrCount, allConverted, missing);
     }
 
-    sb.append("</xml-fragment>");
-    // Must be entity-escaped when embedded as a setting value.
-    return sb.toString().replace("<", "&lt;").replace(">", "&gt;");
-  }
+    /* ============ Helpers ============ */
 
-  private static String escapeXmlAttr(String s) {
-    if (s == null) return "";
-    return s.replace("&", "&amp;").replace("\"", "&quot;")
-            .replace("<", "&lt;").replace(">", "&gt;");
-  }
+    private JsonNode elementToJson(Element elem, ObjectNode target, String path,
+                                   Set<String> xmlAttrPaths, Set<String> jsonAttrPaths) {
+
+        // Attributes
+        NamedNodeMap attrs = elem.getAttributes();
+        if (attrs != null && attrs.getLength() > 0) {
+            ObjectNode attrsNode = target.putObject(ATTR_PREFIX + "attributes");
+            for (int i = 0; i < attrs.getLength(); i++) {
+                Attr a = (Attr) attrs.item(i);
+                String key = a.getName();
+                String val = a.getValue();
+                attrsNode.put(key, val);
+
+                String attrPath = path + "/@" + key;
+                xmlAttrPaths.add(attrPath);
+                jsonAttrPaths.add(attrPath); // tracked symmetrically since we’re emitting them
+            }
+        }
+
+        // Children
+        Map<String, List<Element>> groups = new LinkedHashMap<>();
+        NodeList children = elem.getChildNodes();
+        StringBuilder textBuf = new StringBuilder();
+
+        for (int i = 0; i < children.getLength(); i++) {
+            Node n = children.item(i);
+            if (n instanceof Element) {
+                Element ce = (Element) n;
+                String ln = localName(ce);
+                groups.computeIfAbsent(ln, k -> new ArrayList<>()).add(ce);
+            } else if (n.getNodeType() == Node.TEXT_NODE || n.getNodeType() == Node.CDATA_SECTION_NODE) {
+                textBuf.append(n.getTextContent());
+            }
+        }
+
+        String text = textBuf.toString().trim();
+
+        // If element only has text and no attributes/children -> return text node
+        boolean hasAttrs = target.has(ATTR_PREFIX + "attributes");
+        if (groups.isEmpty()) {
+            if (!hasAttrs) {
+                return text.isEmpty() ? NullNode.instance : new TextNode(text);
+            } else {
+                if (!text.isEmpty()) target.put(TEXT_KEY, text);
+                return target;
+            }
+        }
+
+        // Handle children groups
+        for (Map.Entry<String, List<Element>> e : groups.entrySet()) {
+            String childName = e.getKey();
+            List<Element> items = e.getValue();
+            if (items.size() == 1) {
+                Element only = items.get(0);
+                JsonNode val = elementToJson(only, mapper.createObjectNode(), path + "/" + childName, xmlAttrPaths, jsonAttrPaths);
+                target.set(childName, val);
+            } else {
+                ArrayNode arr = mapper.createArrayNode();
+                for (Element ce : items) {
+                    arr.add(elementToJson(ce, mapper.createObjectNode(), path + "/" + childName + "[" + arr.size() + "]", xmlAttrPaths, jsonAttrPaths));
+                }
+                target.set(childName, arr);
+            }
+        }
+
+        if (!text.isEmpty()) {
+            target.put(TEXT_KEY, text);
+        }
+
+        return target;
+    }
+
+    private static String localName(Element e) {
+        return (e.getLocalName() != null) ? e.getLocalName() : e.getNodeName();
+    }
+
+    private static Optional<Element> firstChildElementByLocalName(Element parent, String wantedLocalName) {
+        NodeList nl = parent.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            Node n = nl.item(i);
+            if (n instanceof Element) {
+                Element e = (Element) n;
+                String ln = (e.getLocalName() != null) ? e.getLocalName() : e.getNodeName();
+                if (wantedLocalName.equalsIgnoreCase(ln)) {
+                    return Optional.of(e);
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Element> firstElementChild(Element parent) {
+        NodeList nl = parent.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            Node n = nl.item(i);
+            if (n instanceof Element) return Optional.of((Element) n);
+        }
+        return Optional.empty();
+    }
 }
+_____________________
+
+
+
+  package com.raj.utilities.web;
+
+import com.raj.utilities.service.XmlToJsonService;
+import com.raj.utilities.service.XmlToJsonService.ConversionResult;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@Controller
+public class XmlToJsonController {
+
+    private final XmlToJsonService service = new XmlToJsonService();
+
+    // Page
+    @GetMapping("/xml-to-json")
+    public String page() {
+        // returns /templates/xml-to-json.html (Thymeleaf) OR static page if you serve it from /static
+        return "xml-to-json";
+    }
+
+    // API
+    @PostMapping(path = "/api/xml-to-json", consumes = MediaType.TEXT_PLAIN_VALUE,
+                 produces = MediaType.APPLICATION_JSON_VALUE)
+    @ResponseBody
+    public Map<String, Object> convert(@RequestBody String xml,
+                                       @RequestParam(name = "unwrapSoapBody", defaultValue = "true") boolean unwrapSoapBody) throws Exception {
+        ConversionResult res = service.convert(xml, unwrapSoapBody);
+        return Map.of(
+                "json", res.prettyJson,
+                "xmlAttributeCount", res.xmlAttributeCount,
+                "jsonAttributeCount", res.jsonAttributeCount,
+                "allAttributesConverted", res.allAttributesConverted,
+                "missingAttributes", res.missingAttributes
+        );
+    }
+}
+___________________________________
+
+  <!-- Add inside your utilities grid on index.html -->
+<a class="card" href="/xml-to-json" style="text-decoration:none;">
+  <div class="card-body">
+    <h3>XML/SOAP → JSON Converter</h3>
+    <p>Paste XML or SOAP; get clean JSON and a full attribute-conversion check.</p>
+  </div>
+</a>
+
+<!-- Quick minimal styles if needed -->
+<style>
+  .card { display:block; border:1px solid #e5e7eb; border-radius:14px; padding:16px; transition:box-shadow .2s; }
+  .card:hover { box-shadow:0 8px 24px rgba(0,0,0,.08);}
+  .card-body h3 { margin:0 0 6px; font-size:1.1rem; }
+  .card-body p { margin:0; color:#444; font-size:.95rem; }
+</style>
+__________________
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>XML/SOAP → JSON Converter · Raj Utilities</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    h1 { margin: 0 0 16px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    textarea { width: 100%; height: 360px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; padding: 10px; border-radius: 10px; border:1px solid #d1d5db; }
+    pre { white-space: pre-wrap; word-wrap: break-word; background:#0b1020; color:#e6edf3; padding: 12px; border-radius: 10px; min-height: 360px; margin:0; }
+    .controls { display:flex; align-items:center; gap:12px; margin: 12px 0 16px; }
+    button { padding: 10px 16px; border-radius: 10px; border:0; cursor:pointer; background:#111827; color:#fff; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .stat { display:inline-block; margin-right: 16px; background:#f3f4f6; padding:6px 10px; border-radius: 8px; font-size: 13px; }
+    .ok { color: #0f766e; }
+    .bad { color: #b91c1c; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom: 8px; }
+    a.back { text-decoration:none; color:#2563eb; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>XML/SOAP → JSON Converter</h1>
+    <a class="back" href="/">← Back to utilities</a>
+  </div>
+
+  <div class="controls">
+    <label><input type="checkbox" id="unwrap" checked/> Unwrap SOAP Body</label>
+    <button id="convertBtn">Convert</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="row">
+    <div>
+      <textarea id="xml" placeholder="Paste XML or SOAP request here..."></textarea>
+    </div>
+    <div>
+      <pre id="json">/* JSON will appear here */</pre>
+      <div id="stats"></div>
+    </div>
+  </div>
+
+  <script>
+    const btn = document.getElementById('convertBtn');
+    const xmlEl = document.getElementById('xml');
+    const jsonEl = document.getElementById('json');
+    const statusEl = document.getElementById('status');
+    const statsEl = document.getElementById('stats');
+    const unwrapEl = document.getElementById('unwrap');
+
+    async function convert() {
+      statsEl.innerHTML = '';
+      jsonEl.textContent = '';
+      const xml = xmlEl.value.trim();
+      if (!xml) {
+        jsonEl.textContent = 'Please paste some XML.';
+        return;
+      }
+      btn.disabled = true;
+      statusEl.textContent = 'Converting...';
+      try {
+        const resp = await fetch('/api/xml-to-json?unwrapSoapBody=' + unwrapEl.checked, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: xml
+        });
+        if (!resp.ok) {
+          const t = await resp.text();
+          throw new Error(t || 'Server error');
+        }
+        const data = await resp.json();
+        jsonEl.textContent = data.json;
+
+        const ok = data.allAttributesConverted;
+        const cls = ok ? 'ok' : 'bad';
+        statsEl.innerHTML = `
+          <div class="stat">XML attributes: <strong>${data.xmlAttributeCount}</strong></div>
+          <div class="stat">JSON attributes: <strong>${data.jsonAttributeCount}</strong></div>
+          <div class="stat ${cls}">${ok ? 'All attributes converted ✔' : 'Missing attributes ⚠'}</div>
+          ${!ok && data.missingAttributes?.length ? `<details style="margin-top:8px;"><summary>See missing</summary><pre>${data.missingAttributes.join('\n')}</pre></details>` : ''}
+        `;
+      } catch (e) {
+        jsonEl.textContent = 'Error: ' + (e.message || e);
+      } finally {
+        btn.disabled = false;
+        statusEl.textContent = '';
+      }
+    }
+    btn.addEventListener('click', convert);
+
+    // Small sample for quick testing
+    xmlEl.value = `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ex="http://example.com">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <ex:CreditRequest id="123" channel="web">
+      <ex:Applicant age="42">
+        <ex:Name first="Ada" last="Lovelace"/>
+      </ex:Applicant>
+      <ex:Amount currency="USD">5000</ex:Amount>
+    </ex:CreditRequest>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+  </script>
+</body>
+</html>
+
+  
