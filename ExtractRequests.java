@@ -17,11 +17,22 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
- * ONE service to handle XML/SOAP → JSON with optional XSD guidance.
- * - In plain mode: arrays by occurrence, robust number coercion.
- * - In XSD mode: arrays/types by schema; ignores number coercion flag (schema decides).
- * - Unwrap SOAP Envelope/Body, parse XML embedded in CDATA (top-level + inline), lowercase root, emit empty arrays.
+ * ONE class that handles XML/SOAP → JSON conversion.
+ *
+ * Features:
+ *  - Optional SOAP Envelope/Body unwrap
+ *  - Parse XML embedded in CDATA/Text (top-level + inline)
+ *  - Flatten attributes (or group under @attributes)
+ *  - Number coercion in plain mode (integers/decimals/booleans)
+ *  - XSD-aware mode: arrays decided by maxOccurs, value types by schema, xsi:nil → null
+ *  - Lowercase root option
+ *  - Optionally emit [] for XSD-defined arrays missing in XML
+ *
+ * Dependencies:
+ *  - Jackson (provided by Spring Boot starter-web, or add jackson-databind)
+ *  - Xerces: xercesImpl:2.12.2 (exclude xml-apis to avoid JDK conflicts)
  */
+// @org.springframework.stereotype.Service  // ← uncomment if you want Spring to autowire it
 public class XmlToJsonUnifiedService {
 
     /* ======================= Options & Result ======================= */
@@ -33,7 +44,7 @@ public class XmlToJsonUnifiedService {
         public boolean coerceNumbers = true;           // plain mode only (schema mode uses XSD types)
         public boolean lowercaseRoot = false;          // Application → application
         public boolean useXsd = false;                 // turn on schema-aware conversion
-        public String  xsdLocation = null;             // "classpath:/xsd/app.xsd" or "file:/path/app.xsd"
+        public String  xsdLocation = null;             // e.g., "classpath:/xsd/application.xsd" or "file:/path/app.xsd"
         public boolean emitEmptyArraysFromXsd = false; // materialize [] for schema arrays missing in XML
     }
 
@@ -49,13 +60,13 @@ public class XmlToJsonUnifiedService {
     /**
      * Convert XML/SOAP into JSON, optionally using an XSD from classpath/file.
      * @param xml UTF-8 XML text
-     * @param opt options
+     * @param opt options (see {@link Options})
      */
     public Result convert(String xml, Options opt) throws Exception {
         if (xml == null || xml.isBlank()) throw new IllegalArgumentException("XML input is empty.");
         if (opt == null) opt = new Options();
 
-        // Parse XML safely
+        // Secure XML parse
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(true);
         dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -70,7 +81,7 @@ public class XmlToJsonUnifiedService {
 
         Element root = doc.getDocumentElement();
 
-        // Unwrap SOAP
+        // Unwrap SOAP Envelope/Body
         if (opt.unwrapSoapBody && localName(root).equalsIgnoreCase("Envelope")) {
             Optional<Element> body = firstByLocalName(root, "Body");
             if (body.isPresent()) {
@@ -93,19 +104,14 @@ public class XmlToJsonUnifiedService {
         String outRoot = opt.lowercaseRoot ? rootName.toLowerCase(Locale.ROOT) : rootName;
 
         if (!opt.useXsd) {
-            // -------------------- PLAIN MODE --------------------
-            Set<String> xmlAttrPaths = new LinkedHashSet<>();
-            Set<String> jsonAttrPaths = new LinkedHashSet<>();
-
-            JsonNode payload = elementToJsonPlain(root, mapper.createObjectNode(), "/" + outRoot,
-                    xmlAttrPaths, jsonAttrPaths, opt);
-
+            // PLAIN MODE
+            JsonNode payload = elementToJsonPlain(root, mapper.createObjectNode(), "/" + outRoot, opt);
             out.set(outRoot, payload);
+
         } else {
-            // -------------------- SCHEMA MODE --------------------
+            // XSD MODE
             XSModel xsdModel = loadXsModel(opt.xsdLocation);
             XSElementDeclaration rootDecl = lookupRootDecl(xsdModel, root);
-
             JsonNode payload = elementToJsonXsd(root, rootDecl, xsdModel, opt);
             out.set(outRoot, payload);
         }
@@ -116,19 +122,14 @@ public class XmlToJsonUnifiedService {
 
     /* ======================= Plain mode ======================= */
 
-    private JsonNode elementToJsonPlain(Element elem, ObjectNode target, String path,
-                                        Set<String> xmlAttrPaths, Set<String> jsonAttrPaths,
-                                        Options opt) throws Exception {
-
+    private JsonNode elementToJsonPlain(Element elem, ObjectNode target, String path, Options opt) throws Exception {
         // Attributes
         NamedNodeMap attrs = elem.getAttributes();
         if (attrs != null && attrs.getLength() > 0) {
             for (int i = 0; i < attrs.getLength(); i++) {
                 Attr a = (Attr) attrs.item(i);
                 if (isXsiNil(a)) continue;
-
-                String key = a.getName();
-                String val = a.getValue();
+                String key = a.getName(), val = a.getValue();
                 if (opt.flattenAttributes) {
                     String slot = target.has(key) ? "_" + key : key;
                     putValue(target, slot, val, opt.coerceNumbers);
@@ -137,24 +138,21 @@ public class XmlToJsonUnifiedService {
                     if (at == null) at = target.putObject("@attributes");
                     putValue(at, key, val, opt.coerceNumbers);
                 }
-                String attrPath = path + "/@" + key;
-                xmlAttrPaths.add(attrPath);
-                jsonAttrPaths.add(attrPath);
             }
         }
 
-        // Children & text
+        // Children + text
         Map<String, List<Element>> groups = groupChildren(elem);
         String rawText = collectText(elem);
         String trimmed = rawText.trim();
 
-        // Inline fragment parsing (only in plain mode)
+        // Inline fragment parse (if element's text contains an XML doc)
         if (opt.parseCdataXml && looksLikeXml(trimmed)) {
             try {
                 Document inner = buildSafeDocument(trimmed);
                 Element innerRoot = inner.getDocumentElement();
                 JsonNode innerJson = elementToJsonPlain(innerRoot, mapper.createObjectNode(),
-                        path + "/" + localName(innerRoot), xmlAttrPaths, jsonAttrPaths, opt);
+                        path + "/" + localName(innerRoot), opt);
                 target.set(localName(innerRoot), innerJson);
             } catch (Exception ignore) { /* keep as text */ }
         }
@@ -162,28 +160,25 @@ public class XmlToJsonUnifiedService {
         // Leaf
         if (groups.isEmpty()) {
             if (target.size() == 0) {
-                if (trimmed.isEmpty()) return NullNode.instance;
-                return new TextNode(trimmed);
+                return trimmed.isEmpty() ? NullNode.instance : new TextNode(trimmed);
             } else {
                 if (!trimmed.isEmpty()) putValue(target, "#text", trimmed, opt.coerceNumbers);
                 return target;
             }
         }
 
-        // Children groups (arrays by occurrence)
+        // Children: arrays by occurrence
         for (Map.Entry<String, List<Element>> e : groups.entrySet()) {
             String childName = e.getKey();
             List<Element> items = e.getValue();
             if (items.size() == 1) {
                 target.set(childName, elementToJsonPlain(items.get(0), mapper.createObjectNode(),
-                        path + "/" + childName, xmlAttrPaths, jsonAttrPaths, opt));
+                        path + "/" + childName, opt));
             } else {
                 ArrayNode arr = mapper.createArrayNode();
-                int idx = 0;
                 for (Element ce : items) {
                     arr.add(elementToJsonPlain(ce, mapper.createObjectNode(),
-                            path + "/" + childName + "[" + (idx++) + "]",
-                            xmlAttrPaths, jsonAttrPaths, opt));
+                            path + "/" + childName, opt));
                 }
                 target.set(childName, arr);
             }
@@ -191,6 +186,35 @@ public class XmlToJsonUnifiedService {
 
         if (!trimmed.isEmpty()) putValue(target, "#text", trimmed, opt.coerceNumbers);
         return target;
+    }
+
+    private static void putValue(ObjectNode node, String key, String raw, boolean coerceNumbers) {
+        if (!coerceNumbers || raw == null) { node.put(key, raw); return; }
+        String v = raw.trim();
+        if (v.isEmpty()) { node.put(key, v); return; }
+
+        // Integer
+        try {
+            String n = v.replace(",", "").replace("_", "");
+            if (n.matches("^[+-]?\\d+$")) { node.put(key, Long.parseLong(n)); return; }
+        } catch (Exception ignore) {}
+
+        // Decimal
+        try {
+            String n = v.replace(",", "").replace("%","").replace("$","");
+            if (n.matches("^[+-]?\\d*(\\.\\d+)?$") && n.matches(".*\\d.*")) {
+                node.put(key, new BigDecimal(n));
+                return;
+            }
+        } catch (Exception ignore) {}
+
+        // Boolean
+        if ("true".equalsIgnoreCase(v) || "false".equalsIgnoreCase(v)) {
+            node.put(key, Boolean.parseBoolean(v));
+            return;
+        }
+
+        node.put(key, raw); // fallback
     }
 
     /* ======================= XSD mode ======================= */
@@ -243,12 +267,11 @@ public class XmlToJsonUnifiedService {
         String text = collectText(elem).trim();
         Map<String, List<Element>> groups = groupChildren(elem);
 
-        // Inline CDATA/XML parsing (schema-aware)
+        // Inline CDATA/XML (schema-aware) — parse if element's text is an XML doc
         if (opt.parseCdataXml && !text.isEmpty() && looksLikeXml(text)) {
             try {
                 Document inner = buildSafeDocument(text);
                 Element innerRoot = inner.getDocumentElement();
-                // Try to bind inner root to a child declaration
                 XSElementDeclaration innerDecl = null;
                 if (elemDecl != null) {
                     ParticleInfo piInner = findChild(elemDecl, localName(innerRoot));
@@ -256,9 +279,7 @@ public class XmlToJsonUnifiedService {
                 }
                 node.set(localName(innerRoot), elementToJsonXsd(innerRoot, innerDecl, model, opt));
                 text = "";
-            } catch (Exception ignore) {
-                // fallback to regular handling
-            }
+            } catch (Exception ignore) {}
         }
 
         // Leaf / simple content by schema
@@ -298,8 +319,7 @@ public class XmlToJsonUnifiedService {
         if (opt.emitEmptyArraysFromXsd && elemDecl != null) {
             XSTypeDefinition t = elemDecl.getTypeDefinition();
             if (t instanceof XSComplexTypeDefinition) {
-                XSComplexTypeDefinition c = (XSComplexTypeDefinition) t;
-                XSParticle p = c.getParticle();
+                XSParticle p = ((XSComplexTypeDefinition) t).getParticle();
                 if (p != null) addMissingArraysFromParticle(node, p);
             }
         }
@@ -355,7 +375,9 @@ public class XmlToJsonUnifiedService {
         return sb.toString();
     }
 
-    private static boolean looksLikeXml(String s) { return s.startsWith("<") && s.endsWith(">") && s.contains("</"); }
+    private static boolean looksLikeXml(String s) {
+        return s.startsWith("<") && s.endsWith(">") && s.contains("</");
+    }
 
     private static Document buildSafeDocument(String xml) throws Exception {
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
@@ -369,23 +391,33 @@ public class XmlToJsonUnifiedService {
         return db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
     }
 
-    private static String localName(Element e) { return (e.getLocalName()!=null) ? e.getLocalName() : e.getNodeName(); }
+    private static String localName(Element e) {
+        return (e.getLocalName()!=null) ? e.getLocalName() : e.getNodeName();
+    }
+
+    private static String safeKey(ObjectNode node, String key) {
+        return node.has(key) ? "_" + key : key;
+    }
 
     /* ======================= XSD loading & queries ======================= */
 
     private XSModel loadXsModel(String location) throws Exception {
-        // Prepare DOM XS loader
+        if (location == null || location.isBlank())
+            throw new IllegalArgumentException("xsdLocation must be provided when useXsd=true");
+
+        // Tell DOM registry to use Xerces XS impl
         System.setProperty(DOMImplementationRegistry.PROPERTY,
                 "org.apache.xerces.dom.DOMXSImplementationSourceImpl");
+
         DOMImplementationRegistry registry = DOMImplementationRegistry.newInstance();
         DOMImplementation impl = registry.getDOMImplementation("XS-Loader");
         if (!(impl instanceof XSImplementation)) {
-            throw new IllegalStateException("XS-Loader not available; ensure xercesImpl is on the classpath (exclude xml-apis).");
+            throw new IllegalStateException("XS-Loader not available; ensure xercesImpl on classpath (exclude xml-apis).");
         }
+
         XSImplementation xsImpl = (XSImplementation) impl;
         XSLoader loader = xsImpl.createXSLoader(null);
 
-        // Load XSD bytes from classpath or file
         byte[] bytes = readAll(resolve(location));
         DOMInputImpl in = new DOMInputImpl();
         in.setStringData(new String(bytes, StandardCharsets.UTF_8));
@@ -395,8 +427,6 @@ public class XmlToJsonUnifiedService {
     }
 
     private InputStream resolve(String location) throws Exception {
-        if (location == null || location.isBlank())
-            throw new IllegalArgumentException("xsdLocation must be provided when useXsd=true");
         if (location.startsWith("classpath:")) {
             String p = location.substring("classpath:".length());
             InputStream in = XmlToJsonUnifiedService.class.getResourceAsStream(p.startsWith("/") ? p : "/" + p);
@@ -407,7 +437,7 @@ public class XmlToJsonUnifiedService {
             java.net.URI uri = java.net.URI.create(location);
             return java.nio.file.Files.newInputStream(java.nio.file.Paths.get(uri));
         }
-        // default to classpath:
+        // default → classpath
         InputStream in = XmlToJsonUnifiedService.class.getResourceAsStream(location.startsWith("/") ? location : "/" + location);
         if (in == null) throw new IllegalArgumentException("Classpath resource not found: " + location);
         return in;
@@ -429,7 +459,7 @@ public class XmlToJsonUnifiedService {
         if (decl == null) return emptyObjectList();
         XSTypeDefinition t = decl.getTypeDefinition();
         if (t instanceof XSComplexTypeDefinition) {
-            return ((XSComplexTypeDefinition) t).getAttributeUses(); // many Xerces builds expose XSObjectList here
+            return ((XSComplexTypeDefinition) t).getAttributeUses(); // XSObjectList in many Xerces builds
         }
         return emptyObjectList();
     }
@@ -526,7 +556,7 @@ public class XmlToJsonUnifiedService {
         }
     }
 
-    /* === tiny types === */
+    /* tiny type */
     private static final class ParticleInfo {
         final XSElementDeclaration decl;
         final int minOccurs;
@@ -535,8 +565,31 @@ public class XmlToJsonUnifiedService {
             this.decl = decl; this.minOccurs = minOccurs; this.maxOccurs = maxOccurs;
         }
     }
+
+    /* ===== Small DOM helpers ===== */
+
+    private static Optional<Element> firstByLocalName(Element p, String ln) {
+        NodeList nl = p.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            Node n = nl.item(i);
+            if (n instanceof Element) {
+                Element e = (Element) n;
+                if (ln.equalsIgnoreCase(localName(e))) return Optional.of(e);
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Element> firstElementChild(Element p) {
+        NodeList nl = p.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            if (nl.item(i) instanceof Element) return Optional.of((Element) nl.item(i));
+        }
+        return Optional.empty();
+    }
 }
-***************
+*******************************
+
 
     package com.raj.utilities.web;
 
@@ -545,6 +598,8 @@ import com.raj.utilities.service.XmlToJsonUnifiedService.Options;
 import com.raj.utilities.service.XmlToJsonUnifiedService.Result;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.bind.annotation.*;
 
 import java.nio.charset.StandardCharsets;
@@ -552,27 +607,43 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/xml-to-json")
-public class XmlToJsonApi {
+// @CrossOrigin(origins = "*") // ← uncomment if your UI runs on another origin
+public class XmlToJsonController {
 
-    private final XmlToJsonUnifiedService svc = new XmlToJsonUnifiedService();
+    private final XmlToJsonUnifiedService converter;
 
     @Value("${raj.xml2json.xsd:classpath:/xsd/application.xsd}")
     private String defaultXsdLocation;
 
+    public XmlToJsonController(XmlToJsonUnifiedService converter) {
+        this.converter = converter;
+    }
+
     @PostMapping(
-        consumes = { MediaType.TEXT_PLAIN_VALUE, MediaType.APPLICATION_XML_VALUE, MediaType.TEXT_XML_VALUE, MediaType.APPLICATION_OCTET_STREAM_VALUE },
+        consumes = {
+            MediaType.TEXT_PLAIN_VALUE,
+            MediaType.APPLICATION_XML_VALUE,
+            MediaType.TEXT_XML_VALUE,
+            MediaType.APPLICATION_OCTET_STREAM_VALUE
+        },
         produces = MediaType.APPLICATION_JSON_VALUE
     )
-    public Map<String, Object> convert(
+    public ResponseEntity<Map<String, Object>> convert(
         @RequestBody byte[] body,
-        @RequestParam(name="unwrapSoapBody",    defaultValue="true")  boolean unwrapSoapBody,
-        @RequestParam(name="parseCdataXml",     defaultValue="true")  boolean parseCdataXml,
-        @RequestParam(name="flattenAttributes", defaultValue="true")  boolean flattenAttributes,
-        @RequestParam(name="coerceNumbers",     defaultValue="true")  boolean coerceNumbers,
-        @RequestParam(name="lowercaseRoot",     defaultValue="false") boolean lowercaseRoot,
-        @RequestParam(name="useXsd",            defaultValue="false") boolean useXsd,
-        @RequestParam(name="xsdPath",           required = false)     String xsdPath,
-        @RequestParam(name="emitEmptyArraysFromXsd", defaultValue="false") boolean emitEmptyArraysFromXsd
+
+        // Common flags
+        @RequestParam(name = "unwrapSoapBody",    defaultValue = "true")  boolean unwrapSoapBody,
+        @RequestParam(name = "parseCdataXml",     defaultValue = "true")  boolean parseCdataXml,
+        @RequestParam(name = "flattenAttributes", defaultValue = "true")  boolean flattenAttributes,
+        @RequestParam(name = "lowercaseRoot",     defaultValue = "false") boolean lowercaseRoot,
+
+        // Plain mode only
+        @RequestParam(name = "coerceNumbers",     defaultValue = "true")  boolean coerceNumbers,
+
+        // XSD mode
+        @RequestParam(name = "useXsd",            defaultValue = "false") boolean useXsd,
+        @RequestParam(name = "xsdPath",           required = false)       String xsdPath,
+        @RequestParam(name = "emitEmptyArraysFromXsd", defaultValue = "false") boolean emitEmptyArraysFromXsd
     ) throws Exception {
 
         String xml = new String(body, StandardCharsets.UTF_8);
@@ -581,219 +652,40 @@ public class XmlToJsonApi {
         opt.unwrapSoapBody = unwrapSoapBody;
         opt.parseCdataXml = parseCdataXml;
         opt.flattenAttributes = flattenAttributes;
-        opt.coerceNumbers = coerceNumbers;     // ignored in XSD mode (schema decides)
+        opt.coerceNumbers = coerceNumbers;                 // ignored in XSD mode
         opt.lowercaseRoot = lowercaseRoot;
         opt.useXsd = useXsd;
-        opt.xsdLocation = (xsdPath != null && !xsdPath.isBlank()) ? xsdPath : defaultXsdLocation;
+        opt.xsdLocation = (xsdPath != null && !xsdPath.isBlank()) ? normalizeLocation(xsdPath) : defaultXsdLocation;
         opt.emitEmptyArraysFromXsd = emitEmptyArraysFromXsd;
 
-        Result res = svc.convert(xml, opt);
-
-        // Plain mode had attribute stats in earlier iterations. This unified service focuses on output JSON.
-        return Map.of(
+        Result res = converter.convert(xml, opt);
+        return ResponseEntity.ok(Map.of(
             "json", res.prettyJson,
             "schemaMode", useXsd
-        );
+        ));
+    }
+
+    @GetMapping(path = "/health", produces = MimeTypeUtils.TEXT_PLAIN_VALUE)
+    public String health() { return "OK"; }
+
+    private static String normalizeLocation(String loc) {
+        if (loc.startsWith("classpath:") || loc.startsWith("file:")) return loc;
+        return "classpath:" + (loc.startsWith("/") ? loc : "/" + loc);
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, String>> badInput(IllegalArgumentException ex) {
+        return ResponseEntity.badRequest().body(Map.of(
+            "error", "Bad request",
+            "message", ex.getMessage() == null ? "Invalid input" : ex.getMessage()
+        ));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, String>> error(Exception ex) {
+        return ResponseEntity.status(500).body(Map.of(
+            "error", "Conversion failed",
+            "message", String.valueOf(ex.getMessage())
+        ));
     }
 }
-***********************
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <title>XML/SOAP → JSON · Raj Utilities</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <meta name="color-scheme" content="light dark">
-  <style>
-    :root{
-      --bg:#0b0f1a; --fg:#e7e9ee; --muted:#a7b0bf; --card:#0f1524; --border:#233049; --accent:#7c9cff;
-      --chip:#141c30; --ok:#34d399; --bad:#f87171; --btn:#1c2336; --btn-fg:#e7e9ee; --link:#9bb3ff;
-      --codebg:#0c1222; --codefg:#e7e9ee;
-    }
-    @media (prefers-color-scheme: light){
-      :root{
-        --bg:#f7f8fb; --fg:#0d1320; --muted:#5b6577; --card:#ffffff; --border:#e5e9f2; --accent:#3b6cff;
-        --chip:#f1f4fb; --ok:#0f766e; --bad:#b91c1c; --btn:#0d1320; --btn-fg:#ffffff; --link:#305dff;
-        --codebg:#0b1020; --codefg:#e7e9ee;
-      }
-    }
-    *{box-sizing:border-box}
-    body{margin:28px;font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--fg);background:var(--bg)}
-    .container{max-width:1200px;margin:0 auto}
-    .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
-    h1{margin:0;font-size:1.5rem}
-    a.back{color:var(--link);text-decoration:none}
-    .panel{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px}
-    .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:14px}
-    .switch{display:flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);padding:8px 10px;border-radius:12px}
-    .switch input[type="checkbox"]{width:16px;height:16px}
-    .text{display:flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);padding:8px 10px;border-radius:12px}
-    .text input{border:none;outline:none;background:transparent;color:var(--fg);min-width:260px}
-    .btn{padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:var(--btn);color:var(--btn-fg);cursor:pointer}
-    .btn.secondary{background:transparent;color:var(--fg)}
-    .btn[disabled]{opacity:.6;cursor:not-allowed}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-    @media (max-width: 980px){.grid{grid-template-columns:1fr}}
-    .col-head{margin:8px 0 8px;color:var(--muted);font-weight:600}
-    textarea{width:100%;min-height:420px;resize:vertical;border-radius:14px;border:1px solid var(--border);
-      background:var(--bg);color:var(--fg);padding:12px;font:13px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-    pre.code{white-space:pre-wrap;word-wrap:break-word;background:var(--codebg);color:var(--codefg);border-radius:14px;
-      border:1px solid var(--border);padding:12px;min-height:420px;margin:0}
-    .hint{margin-top:10px;color:var(--muted)}
-  </style>
-</head>
-<body>
-<div class="container">
-  <div class="topbar">
-    <h1>XML/SOAP → JSON Converter</h1>
-    <div style="display:flex;gap:8px;align-items:center">
-      <a class="back" href="/">← Back to utilities</a>
-      <button id="loadSample" class="btn secondary" title="Load a SOAP+CDATA sample">Load sample</button>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="controls" id="controls">
-      <!-- Plain/XSD-common options -->
-      <label class="switch" title="Remove SOAP envelope and target Body/payload">
-        <input type="checkbox" id="unwrap" checked>
-        <span>Unwrap SOAP Body</span>
-      </label>
-      <label class="switch" title="Parse XML inside CDATA/Text nodes">
-        <input type="checkbox" id="parseCdata" checked>
-        <span>Parse XML in CDATA</span>
-      </label>
-      <label class="switch" title="Place XML attributes as sibling JSON properties">
-        <input type="checkbox" id="flatten" checked>
-        <span>Flatten attributes</span>
-      </label>
-      <label class="switch" title="Try to convert numeric-looking strings to numbers (plain mode)">
-        <input type="checkbox" id="coerce" checked>
-        <span>Coerce numbers</span>
-      </label>
-      <label class="switch" title="Make the top JSON key lowercase (Application → application)">
-        <input type="checkbox" id="lowerRoot">
-        <span>Lowercase root</span>
-      </label>
-
-      <!-- XSD mode -->
-      <label class="switch" title="Use XSD to force arrays/types">
-        <input type="checkbox" id="useXsd">
-        <span>Use XSD (arrays/types)</span>
-      </label>
-      <label class="text" title="Override the classpath XSD (optional)">
-        <span>XSD path</span>
-        <input type="text" id="xsdPath" placeholder="classpath:/xsd/application.xsd">
-      </label>
-      <label class="switch" title="Emit [] for array elements defined in XSD but missing in XML">
-        <input type="checkbox" id="emitEmpty">
-        <span>Emit empty arrays</span>
-      </label>
-
-      <button id="convertBtn" class="btn">Convert</button>
-      <button id="clearBtn" class="btn secondary">Clear</button>
-      <span id="status" style="margin-left:auto;color:var(--muted)"></span>
-    </div>
-
-    <div class="grid">
-      <div>
-        <div class="col-head">Input (XML or SOAP)</div>
-        <textarea id="xml" placeholder="Paste your XML or SOAP request here…"></textarea>
-        <div class="hint">Tip: Keep “Parse XML in CDATA” on if your payload is wrapped inside &lt;![CDATA[ … ]]&gt;.</div>
-      </div>
-      <div>
-        <div class="col-head">Output (JSON)</div>
-        <pre id="json" class="code">/* JSON will appear here */</pre>
-        <div style="margin-top:10px;display:flex;gap:8px">
-          <button id="copyBtn" class="btn secondary" title="Copy JSON to clipboard">Copy JSON</button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-  const $ = (id) => document.getElementById(id);
-  const xmlEl = $("xml"), jsonEl = $("json"), statusEl = $("status");
-  const btn = $("convertBtn");
-
-  const unwrapEl = $("unwrap"), parseCdataEl = $("parseCdata"), flattenEl = $("flatten"),
-        coerceEl = $("coerce"), lowerRootEl = $("lowerRoot"),
-        useXsdEl = $("useXsd"), xsdPathEl = $("xsdPath"), emitEmptyEl = $("emitEmpty");
-
-  $("clearBtn").addEventListener("click", () => {
-    xmlEl.value = ""; jsonEl.textContent = "/* JSON will appear here */";
-  });
-
-  $("copyBtn").addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(jsonEl.textContent || "");
-      statusEl.textContent = "Copied!";
-      setTimeout(() => statusEl.textContent = "", 900);
-    } catch { /* ignore */ }
-  });
-
-  $("loadSample").addEventListener("click", () => {
-    xmlEl.value =
-`<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:inv="http://invoker.ps.example">
-  <soapenv:Header/>
-  <soapenv:Body>
-    <inv:inputXml><![CDATA[
-      <Application DeliveryOptionCode="PenFed-52538" ProcessingRequestType="DA">
-        <CreditRequest DMfunction="GBL" DMProduct="NVH" ProductCategory="AutoLoans"/>
-        <CreditApplication>
-          <type xType="OM_CREDIT_APPLICATION_TYPE_INDIVIDUAL">OM_CREDIT_APPLICATION_TYPE_INDIVIDUAL</type>
-          <enteredTimestamp>2024-01-04T14:05:14</enteredTimestamp>
-          <applicationCreatedTimestamp>2024-01-04T14:05:08</applicationCreatedTimestamp>
-          <RequestType>ReqOffer</RequestType>
-          <LoanSourceId>Branch</LoanSourceId>
-          <DEBT_RATIO>0.5</DEBT_RATIO>
-          <PAYMENT_PER_AMOUNT>1,000</PAYMENT_PER_AMOUNT>
-        </CreditApplication>
-      </Application>
-    ]]></inv:inputXml>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-  });
-
-  async function convert() {
-    jsonEl.textContent = "";
-    const xml = xmlEl.value.trim();
-    if (!xml) { jsonEl.textContent = "Please paste some XML."; return; }
-
-    btn.disabled = true;
-    statusEl.textContent = "Converting…";
-    try {
-      const qs = new URLSearchParams({
-        unwrapSoapBody: unwrapEl.checked,
-        parseCdataXml: parseCdataEl.checked,
-        flattenAttributes: flattenEl.checked,
-        coerceNumbers: coerceEl.checked,
-        lowercaseRoot: lowerRootEl.checked,
-        useXsd: useXsdEl.checked,
-        xsdPath: xsdPathEl.value.trim(),
-        emitEmptyArraysFromXsd: emitEmptyEl.checked
-      }).toString();
-
-      const resp = await fetch("/api/xml-to-json?" + qs, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: xml
-      });
-      if (!resp.ok) throw new Error(await resp.text());
-      const data = await resp.json();
-      jsonEl.textContent = data.json;
-    } catch (e) {
-      jsonEl.textContent = "Error: " + (e.message || e);
-    } finally {
-      btn.disabled = false;
-      statusEl.textContent = "";
-    }
-  }
-
-  btn.addEventListener("click", convert);
-</script>
-</body>
-</html>
-
-    
