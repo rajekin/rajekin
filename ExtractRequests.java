@@ -7,6 +7,7 @@ import org.apache.xerces.dom.DOMInputImpl;
 import org.apache.xerces.xs.*;
 import org.w3c.dom.*;
 import org.w3c.dom.bootstrap.DOMImplementationRegistry;
+import org.springframework.stereotype.Service;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -27,12 +28,8 @@ import java.util.*;
  *  - XSD-aware mode: arrays decided by maxOccurs, value types by schema, xsi:nil → null
  *  - Lowercase root option
  *  - Optionally emit [] for XSD-defined arrays missing in XML
- *
- * Dependencies:
- *  - Jackson (provided by Spring Boot starter-web, or add jackson-databind)
- *  - Xerces: xercesImpl:2.12.2 (exclude xml-apis to avoid JDK conflicts)
  */
-// @org.springframework.stereotype.Service  // ← uncomment if you want Spring to autowire it
+@Service
 public class XmlToJsonUnifiedService {
 
     /* ======================= Options & Result ======================= */
@@ -58,9 +55,8 @@ public class XmlToJsonUnifiedService {
     /* ======================= Public API ======================= */
 
     /**
-     * Convert XML/SOAP into JSON, optionally using an XSD from classpath/file.
-     * @param xml UTF-8 XML text
-     * @param opt options (see {@link Options})
+     * Convert XML/SOAP into JSON, optionally using an XSD.
+     * Controller can pass bare "xsd/app.xsd"; this service normalizes to classpath:/xsd/app.xsd.
      */
     public Result convert(String xml, Options opt) throws Exception {
         if (xml == null || xml.isBlank()) throw new IllegalArgumentException("XML input is empty.");
@@ -107,10 +103,10 @@ public class XmlToJsonUnifiedService {
             // PLAIN MODE
             JsonNode payload = elementToJsonPlain(root, mapper.createObjectNode(), "/" + outRoot, opt);
             out.set(outRoot, payload);
-
         } else {
             // XSD MODE
-            XSModel xsdModel = loadXsModel(opt.xsdLocation);
+            String normalized = normalizeLocation(opt.xsdLocation);
+            XSModel xsdModel = loadXsModel(normalized);
             XSElementDeclaration rootDecl = lookupRootDecl(xsdModel, root);
             JsonNode payload = elementToJsonXsd(root, rootDecl, xsdModel, opt);
             out.set(outRoot, payload);
@@ -143,26 +139,26 @@ public class XmlToJsonUnifiedService {
 
         // Children + text
         Map<String, List<Element>> groups = groupChildren(elem);
-        String rawText = collectText(elem);
-        String trimmed = rawText.trim();
+        String rawText = collectText(elem).trim();
 
         // Inline fragment parse (if element's text contains an XML doc)
-        if (opt.parseCdataXml && looksLikeXml(trimmed)) {
+        if (opt.parseCdataXml && looksLikeXml(rawText)) {
             try {
-                Document inner = buildSafeDocument(trimmed);
+                Document inner = buildSafeDocument(rawText);
                 Element innerRoot = inner.getDocumentElement();
                 JsonNode innerJson = elementToJsonPlain(innerRoot, mapper.createObjectNode(),
                         path + "/" + localName(innerRoot), opt);
                 target.set(localName(innerRoot), innerJson);
+                rawText = ""; // consumed
             } catch (Exception ignore) { /* keep as text */ }
         }
 
         // Leaf
         if (groups.isEmpty()) {
             if (target.size() == 0) {
-                return trimmed.isEmpty() ? NullNode.instance : new TextNode(trimmed);
+                return rawText.isEmpty() ? NullNode.instance : new TextNode(rawText);
             } else {
-                if (!trimmed.isEmpty()) putValue(target, "#text", trimmed, opt.coerceNumbers);
+                if (!rawText.isEmpty()) putValue(target, "#text", rawText, opt.coerceNumbers);
                 return target;
             }
         }
@@ -184,7 +180,7 @@ public class XmlToJsonUnifiedService {
             }
         }
 
-        if (!trimmed.isEmpty()) putValue(target, "#text", trimmed, opt.coerceNumbers);
+        if (!rawText.isEmpty()) putValue(target, "#text", rawText, opt.coerceNumbers);
         return target;
     }
 
@@ -401,6 +397,13 @@ public class XmlToJsonUnifiedService {
 
     /* ======================= XSD loading & queries ======================= */
 
+    /** Accepts bare "xsd/app.xsd", "classpath:/xsd/app.xsd", or "file:/abs/path/app.xsd". */
+    private static String normalizeLocation(String loc) {
+        if (loc == null || loc.isBlank()) return loc;
+        if (loc.startsWith("classpath:") || loc.startsWith("file:")) return loc;
+        return "classpath:" + (loc.startsWith("/") ? loc : "/" + loc);
+    }
+
     private XSModel loadXsModel(String location) throws Exception {
         if (location == null || location.isBlank())
             throw new IllegalArgumentException("xsdLocation must be provided when useXsd=true");
@@ -586,106 +589,5 @@ public class XmlToJsonUnifiedService {
             if (nl.item(i) instanceof Element) return Optional.of((Element) nl.item(i));
         }
         return Optional.empty();
-    }
-}
-*******************************
-
-
-    package com.raj.utilities.web;
-
-import com.raj.utilities.service.XmlToJsonUnifiedService;
-import com.raj.utilities.service.XmlToJsonUnifiedService.Options;
-import com.raj.utilities.service.XmlToJsonUnifiedService.Result;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.util.MimeTypeUtils;
-import org.springframework.web.bind.annotation.*;
-
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-
-@RestController
-@RequestMapping("/api/xml-to-json")
-// @CrossOrigin(origins = "*") // ← uncomment if your UI runs on another origin
-public class XmlToJsonController {
-
-    private final XmlToJsonUnifiedService converter;
-
-    @Value("${raj.xml2json.xsd:classpath:/xsd/application.xsd}")
-    private String defaultXsdLocation;
-
-    public XmlToJsonController(XmlToJsonUnifiedService converter) {
-        this.converter = converter;
-    }
-
-    @PostMapping(
-        consumes = {
-            MediaType.TEXT_PLAIN_VALUE,
-            MediaType.APPLICATION_XML_VALUE,
-            MediaType.TEXT_XML_VALUE,
-            MediaType.APPLICATION_OCTET_STREAM_VALUE
-        },
-        produces = MediaType.APPLICATION_JSON_VALUE
-    )
-    public ResponseEntity<Map<String, Object>> convert(
-        @RequestBody byte[] body,
-
-        // Common flags
-        @RequestParam(name = "unwrapSoapBody",    defaultValue = "true")  boolean unwrapSoapBody,
-        @RequestParam(name = "parseCdataXml",     defaultValue = "true")  boolean parseCdataXml,
-        @RequestParam(name = "flattenAttributes", defaultValue = "true")  boolean flattenAttributes,
-        @RequestParam(name = "lowercaseRoot",     defaultValue = "false") boolean lowercaseRoot,
-
-        // Plain mode only
-        @RequestParam(name = "coerceNumbers",     defaultValue = "true")  boolean coerceNumbers,
-
-        // XSD mode
-        @RequestParam(name = "useXsd",            defaultValue = "false") boolean useXsd,
-        @RequestParam(name = "xsdPath",           required = false)       String xsdPath,
-        @RequestParam(name = "emitEmptyArraysFromXsd", defaultValue = "false") boolean emitEmptyArraysFromXsd
-    ) throws Exception {
-
-        String xml = new String(body, StandardCharsets.UTF_8);
-
-        Options opt = new Options();
-        opt.unwrapSoapBody = unwrapSoapBody;
-        opt.parseCdataXml = parseCdataXml;
-        opt.flattenAttributes = flattenAttributes;
-        opt.coerceNumbers = coerceNumbers;                 // ignored in XSD mode
-        opt.lowercaseRoot = lowercaseRoot;
-        opt.useXsd = useXsd;
-        opt.xsdLocation = (xsdPath != null && !xsdPath.isBlank()) ? normalizeLocation(xsdPath) : defaultXsdLocation;
-        opt.emitEmptyArraysFromXsd = emitEmptyArraysFromXsd;
-
-        Result res = converter.convert(xml, opt);
-        return ResponseEntity.ok(Map.of(
-            "json", res.prettyJson,
-            "schemaMode", useXsd
-        ));
-    }
-
-    @GetMapping(path = "/health", produces = MimeTypeUtils.TEXT_PLAIN_VALUE)
-    public String health() { return "OK"; }
-
-    private static String normalizeLocation(String loc) {
-        if (loc.startsWith("classpath:") || loc.startsWith("file:")) return loc;
-        return "classpath:" + (loc.startsWith("/") ? loc : "/" + loc);
-    }
-
-    @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<Map<String, String>> badInput(IllegalArgumentException ex) {
-        return ResponseEntity.badRequest().body(Map.of(
-            "error", "Bad request",
-            "message", ex.getMessage() == null ? "Invalid input" : ex.getMessage()
-        ));
-    }
-
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<Map<String, String>> error(Exception ex) {
-        return ResponseEntity.status(500).body(Map.of(
-            "error", "Conversion failed",
-            "message", String.valueOf(ex.getMessage())
-        ));
     }
 }
