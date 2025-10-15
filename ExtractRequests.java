@@ -9,10 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 
 /**
- * Lightweight helper that loads an XSD into an XSModel and exposes a few utilities:
- *  - find global elements
- *  - find a child particle under a parent element (with min/maxOccurs)
- *  - map simple types to coarse ValueKind without relying on getPrimitiveKind()
+ * Loads an XSD into XSModel and provides helpers:
+ *  - getGlobalElement
+ *  - findChild (returns min/maxOccurs)
+ *  - valueKind classification (portable; no getPrimitiveKind())
+ *  - attributesOf (returns a SAFE empty XSAttributeUseList when none)
  */
 public final class XsdSchemaModel {
 
@@ -22,7 +23,6 @@ public final class XsdSchemaModel {
 
     /** Load an XSD from bytes using Xerces XS loader. */
     public static XsdSchemaModel fromBytes(byte[] xsdBytes) throws Exception {
-        // Ensure Xerces XS implementation is used
         System.setProperty(DOMImplementationRegistry.PROPERTY,
                 "org.apache.xerces.dom.DOMXSImplementationSourceImpl");
 
@@ -42,12 +42,12 @@ public final class XsdSchemaModel {
         return new XsdSchemaModel(model);
     }
 
-    /** Lookup a global element by local name + namespace (empty string for no-NS). */
+    /** Lookup a global element by local name + namespace (use "" for no namespace). */
     public XSElementDeclaration getGlobalElement(String localName, String ns) {
         return model.getElementDeclaration(localName, ns == null ? "" : ns);
     }
 
-    /** Find a direct/indirect child element particle under the given parent element by local name. */
+    /** Find a (possibly nested) child element particle by local name under a parent element. */
     public Optional<ParticleInfo> findChild(XSElementDeclaration parent, String childLocalName) {
         if (parent == null) return Optional.empty();
         XSTypeDefinition t = parent.getTypeDefinition();
@@ -79,7 +79,7 @@ public final class XsdSchemaModel {
         return Optional.empty();
     }
 
-    /** Classify value kind from a type or element (portable across Xerces variants). */
+    /** Coarse value kind for an element/type (STRING, INTEGER, DECIMAL, FLOATING, BOOLEAN, LIST, OBJECT). */
     public ValueKind valueKind(XSElementDeclaration decl) {
         if (decl == null) return ValueKind.STRING;
         return valueKind(decl.getTypeDefinition());
@@ -89,11 +89,9 @@ public final class XsdSchemaModel {
         if (t instanceof XSSimpleTypeDefinition) {
             XSSimpleTypeDefinition s = (XSSimpleTypeDefinition) t;
 
-            // List simple types (e.g., xsd:list) → LIST
             if (s.getVariety() == XSSimpleTypeDefinition.VARIETY_LIST) return ValueKind.LIST;
 
-            // Determine primitive via primitiveType/builtInKind (no getPrimitiveKind())
-            short kind = primitiveKind(s);
+            short kind = primitiveKind(s); // portable (no getPrimitiveKind())
             switch (kind) {
                 case XSConstants.BOOLEAN_DT:  return ValueKind.BOOLEAN;
                 case XSConstants.DECIMAL_DT:  return ValueKind.DECIMAL;
@@ -117,14 +115,14 @@ public final class XsdSchemaModel {
         return ValueKind.STRING;
     }
 
-    /** Attribute list for a complex element type. */
+    /** Attribute list for a complex element type (never null; returns a SAFE empty list). */
     public XSAttributeUseList attributesOf(XSElementDeclaration decl) {
-        if (decl == null) return XSAttributeUseListImpl.EMPTY_LIST;
+        if (decl == null) return emptyAttrUseList();
         XSTypeDefinition t = decl.getTypeDefinition();
         if (t instanceof XSComplexTypeDefinition) {
             return ((XSComplexTypeDefinition) t).getAttributeUses();
         }
-        return XSAttributeUseListImpl.EMPTY_LIST;
+        return emptyAttrUseList();
     }
 
     /** Unbounded or >1 counts as an array. */
@@ -132,11 +130,21 @@ public final class XsdSchemaModel {
         return pi != null && (pi.maxOccurs == Integer.MAX_VALUE || pi.maxOccurs > 1);
     }
 
-    /** Portable primitive kind resolution. */
+    /** Portable primitive kind without using getPrimitiveKind(). */
     private static short primitiveKind(XSSimpleTypeDefinition s) {
         XSSimpleTypeDefinition p = s.getPrimitiveType();
         return (p != null) ? p.getBuiltInKind() : s.getBuiltInKind();
     }
+
+    /** Safe empty XSAttributeUseList (avoids referencing XSAttributeUseListImpl). */
+    private static XSAttributeUseList emptyAttrUseList() {
+        return new XSAttributeUseList() {
+            @Override public int getLength() { return 0; }
+            @Override public XSAttributeUse item(int index) { return null; }
+        };
+    }
+
+    /* === Types === */
 
     public static final class ParticleInfo {
         public final XSElementDeclaration decl;
@@ -149,11 +157,11 @@ public final class XsdSchemaModel {
 
     public enum ValueKind { STRING, INTEGER, DECIMAL, FLOATING, BOOLEAN, LIST, OBJECT }
 }
-**********************************
 
 
+*********************
 
-  package com.raj.utilities.service.xsd;
+    package com.raj.utilities.service.xsd;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -167,21 +175,9 @@ import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-import static com.raj.utilities.service.xsd.XsdSchemaModel.particleIsArray;
-
-/**
- * Schema-aware XML→JSON:
- *  - Arrays driven by maxOccurs (>1 or unbounded) even if only one child in XML
- *  - Simple-type coercion (boolean/integers/decimals/floats/list) via XSD
- *  - xsi:nil="true" → JSON null
- *  - Optional: emit [] for XSD-defined arrays missing in XML
- *  - Still supports SOAP unwrap + CDATA inner XML promotion
- */
 public class XmlToJsonXsdService {
 
     private final ObjectMapper mapper = new ObjectMapper();
-
-    /* ==== Options & Result ==== */
 
     public static final class Options {
         public boolean unwrapSoapBody = true;
@@ -196,16 +192,12 @@ public class XmlToJsonXsdService {
         public Result(String prettyJson){ this.prettyJson = prettyJson; }
     }
 
-    /* ==== Public entrypoint ==== */
-
     public Result convertUsingXsd(String xml, byte[] xsdBytes, Options opt) throws Exception {
         if (xml == null || xml.isBlank()) throw new IllegalArgumentException("XML input is empty.");
         if (opt == null) opt = new Options();
 
-        // Load schema
         XsdSchemaModel xsd = XsdSchemaModel.fromBytes(xsdBytes);
 
-        // Parse XML (secure)
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(true);
         dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -220,7 +212,6 @@ public class XmlToJsonXsdService {
 
         Element root = doc.getDocumentElement();
 
-        // SOAP unwrap
         if (opt.unwrapSoapBody && localName(root).equalsIgnoreCase("Envelope")) {
             Optional<Element> body = firstByLocalName(root, "Body");
             if (body.isPresent()) {
@@ -228,7 +219,6 @@ public class XmlToJsonXsdService {
                 if (firstPayload.isPresent()) root = firstPayload.get();
             }
         }
-        // Promote inner XML from CDATA/text if present
         if (opt.parseCdataXml) {
             String inner = collectText(root).trim();
             if (looksLikeXml(inner)) {
@@ -237,7 +227,6 @@ public class XmlToJsonXsdService {
             }
         }
 
-        // Bind root to schema
         String rootNs = root.getNamespaceURI();
         String rootName = localName(root);
         XSElementDeclaration rootDecl = xsd.getGlobalElement(rootName, rootNs);
@@ -251,33 +240,33 @@ public class XmlToJsonXsdService {
         return new Result(pretty);
     }
 
-    /* ==== Core conversion ==== */
+    /* ================= core ================= */
 
     private JsonNode elementToJson(Element elem,
                                    XSElementDeclaration elemDecl,
                                    XsdSchemaModel xsd,
                                    Options opt) {
 
-        // xsi:nil → null
+        // xsi:nil="true" → null
         String xsiNil = elem.getAttributeNS("http://www.w3.org/2001/XMLSchema-instance", "nil");
         if ("true".equalsIgnoreCase(xsiNil)) return NullNode.instance;
 
         ObjectNode node = mapper.createObjectNode();
 
-        // Attributes (typed if declared in XSD)
-        XSAttributeUseList attrUses = (elemDecl != null) ? xsd.attributesOf(elemDecl) : XSAttributeUseListImpl.EMPTY_LIST;
+        // Attributes (typed where declared)
+        XSAttributeUseList attrUses = (elemDecl != null) ? xsd.attributesOf(elemDecl) : emptyAttrUseList();
         Map<String, XSSimpleTypeDefinition> attrTypeByLocal = new HashMap<>();
         for (int i = 0; i < attrUses.getLength(); i++) {
-            XSAttributeUse use = (XSAttributeUse) attrUses.item(i);
+            XSAttributeUse use = attrUses.item(i);
+            if (use == null) continue;
             XSAttributeDeclaration ad = use.getAttrDeclaration();
-            attrTypeByLocal.put(ad.getName(), ad.getTypeDefinition());
+            if (ad != null) attrTypeByLocal.put(ad.getName(), ad.getTypeDefinition());
         }
 
         NamedNodeMap attrs = elem.getAttributes();
         if (attrs != null) {
             for (int i = 0; i < attrs.getLength(); i++) {
                 Attr a = (Attr) attrs.item(i);
-                // Skip xsi:nil itself
                 if ("nil".equals(a.getLocalName()) &&
                     "http://www.w3.org/2001/XMLSchema-instance".equals(a.getNamespaceURI())) continue;
 
@@ -296,11 +285,9 @@ public class XmlToJsonXsdService {
             }
         }
 
-        // Text + children
         String text = collectText(elem).trim();
         Map<String, List<Element>> groups = groupChildren(elem);
 
-        // Leaf / simple content
         if (groups.isEmpty()) {
             if (elemDecl != null) {
                 XSSimpleTypeDefinition st = simpleTypeOf(elemDecl);
@@ -314,14 +301,13 @@ public class XmlToJsonXsdService {
             }
         }
 
-        // Children – array shape driven by XSD (not by count)
         for (Map.Entry<String, List<Element>> e : groups.entrySet()) {
             String childLocal = e.getKey();
             List<Element> items = e.getValue();
 
             XsdSchemaModel.ParticleInfo pi = (elemDecl != null) ? xsd.findChild(elemDecl, childLocal).orElse(null) : null;
             XSElementDeclaration childDecl = (pi != null) ? pi.decl : null;
-            boolean forceArray = particleIsArray(pi);
+            boolean forceArray = XsdSchemaModel.particleIsArray(pi); // <— fully-qualified (no static import needed)
 
             if (forceArray) {
                 ArrayNode arr = mapper.createArrayNode();
@@ -334,7 +320,6 @@ public class XmlToJsonXsdService {
             }
         }
 
-        // Optionally materialize missing arrays as []
         if (opt.emitEmptyArraysFromXsd && elemDecl != null) {
             XSTypeDefinition t = elemDecl.getTypeDefinition();
             if (t instanceof XSComplexTypeDefinition) {
@@ -363,7 +348,14 @@ public class XmlToJsonXsdService {
         }
     }
 
-    /* ==== Helpers ==== */
+    /* ================= helpers ================= */
+
+    private static XSAttributeUseList emptyAttrUseList() {
+        return new XSAttributeUseList() {
+            @Override public int getLength() { return 0; }
+            @Override public XSAttributeUse item(int index) { return null; }
+        };
+    }
 
     private static String safeKey(ObjectNode node, String key) {
         return node.has(key) ? "_" + key : key;
@@ -397,21 +389,16 @@ public class XmlToJsonXsdService {
         if (t == null) return new TextNode(value);
         String v = (value == null) ? "" : value.trim();
 
-        // xsd:list → JSON array (split by whitespace)
         if (t.getVariety() == XSSimpleTypeDefinition.VARIETY_LIST) {
             ArrayNode arr = new ObjectMapper().createArrayNode();
             for (String s : v.split("\\s+")) if (!s.isEmpty()) arr.add(s);
             return arr;
         }
 
-        // Determine primitive via primitiveType/builtInKind
+        // Primitive via primitiveType/builtInKind (no getPrimitiveKind())
         short kind;
         XSSimpleTypeDefinition prim = t.getPrimitiveType();
-        if (prim != null) {
-            kind = prim.getBuiltInKind();
-        } else {
-            kind = t.getBuiltInKind();
-        }
+        kind = (prim != null) ? prim.getBuiltInKind() : t.getBuiltInKind();
 
         try {
             switch (kind) {
@@ -438,7 +425,6 @@ public class XmlToJsonXsdService {
                     return new TextNode(value);
             }
         } catch (Exception ignore) {
-            // On any parse issue, keep original string
             return new TextNode(value);
         }
     }
