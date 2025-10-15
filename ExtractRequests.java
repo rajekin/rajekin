@@ -13,7 +13,7 @@ import java.util.Optional;
  *  - getGlobalElement
  *  - findChild (returns min/maxOccurs)
  *  - valueKind classification (portable; no getPrimitiveKind())
- *  - attributesOf (returns a SAFE empty XSAttributeUseList when none)
+ *  - attributesOf (returns a SAFE empty XSObjectList when none)
  */
 public final class XsdSchemaModel {
 
@@ -115,14 +115,14 @@ public final class XsdSchemaModel {
         return ValueKind.STRING;
     }
 
-    /** Attribute list for a complex element type (never null; returns a SAFE empty list). */
-    public XSAttributeUseList attributesOf(XSElementDeclaration decl) {
-        if (decl == null) return emptyAttrUseList();
+    /** Attribute list for a complex element type (never null; returns SAFE empty XSObjectList). */
+    public XSObjectList attributesOf(XSElementDeclaration decl) {
+        if (decl == null) return emptyObjectList();
         XSTypeDefinition t = decl.getTypeDefinition();
         if (t instanceof XSComplexTypeDefinition) {
-            return ((XSComplexTypeDefinition) t).getAttributeUses();
+            return ((XSComplexTypeDefinition) t).getAttributeUses(); // in many builds this returns XSObjectList
         }
-        return emptyAttrUseList();
+        return emptyObjectList();
     }
 
     /** Unbounded or >1 counts as an array. */
@@ -136,11 +136,11 @@ public final class XsdSchemaModel {
         return (p != null) ? p.getBuiltInKind() : s.getBuiltInKind();
     }
 
-    /** Safe empty XSAttributeUseList (avoids referencing XSAttributeUseListImpl). */
-    private static XSAttributeUseList emptyAttrUseList() {
-        return new XSAttributeUseList() {
+    /** Safe empty XSObjectList (avoids depending on internal impl classes). */
+    private static XSObjectList emptyObjectList() {
+        return new XSObjectList() {
             @Override public int getLength() { return 0; }
-            @Override public XSAttributeUse item(int index) { return null; }
+            @Override public XSObject item(int index) { return null; }
         };
     }
 
@@ -157,9 +157,7 @@ public final class XsdSchemaModel {
 
     public enum ValueKind { STRING, INTEGER, DECIMAL, FLOATING, BOOLEAN, LIST, OBJECT }
 }
-
-
-*********************
+************************************************
 
     package com.raj.utilities.service.xsd;
 
@@ -253,12 +251,13 @@ public class XmlToJsonXsdService {
 
         ObjectNode node = mapper.createObjectNode();
 
-        // Attributes (typed where declared)
-        XSAttributeUseList attrUses = (elemDecl != null) ? xsd.attributesOf(elemDecl) : emptyAttrUseList();
+        // Attributes (typed where declared) — use XSObjectList
+        XSObjectList attrUses = (elemDecl != null) ? xsd.attributesOf(elemDecl) : emptyObjectList();
         Map<String, XSSimpleTypeDefinition> attrTypeByLocal = new HashMap<>();
         for (int i = 0; i < attrUses.getLength(); i++) {
-            XSAttributeUse use = attrUses.item(i);
-            if (use == null) continue;
+            XSObject xo = attrUses.item(i);
+            if (!(xo instanceof XSAttributeUse)) continue;
+            XSAttributeUse use = (XSAttributeUse) xo;
             XSAttributeDeclaration ad = use.getAttrDeclaration();
             if (ad != null) attrTypeByLocal.put(ad.getName(), ad.getTypeDefinition());
         }
@@ -307,7 +306,7 @@ public class XmlToJsonXsdService {
 
             XsdSchemaModel.ParticleInfo pi = (elemDecl != null) ? xsd.findChild(elemDecl, childLocal).orElse(null) : null;
             XSElementDeclaration childDecl = (pi != null) ? pi.decl : null;
-            boolean forceArray = XsdSchemaModel.particleIsArray(pi); // <— fully-qualified (no static import needed)
+            boolean forceArray = XsdSchemaModel.particleIsArray(pi);
 
             if (forceArray) {
                 ArrayNode arr = mapper.createArrayNode();
@@ -350,10 +349,10 @@ public class XmlToJsonXsdService {
 
     /* ================= helpers ================= */
 
-    private static XSAttributeUseList emptyAttrUseList() {
-        return new XSAttributeUseList() {
+    private static XSObjectList emptyObjectList() {
+        return new XSObjectList() {
             @Override public int getLength() { return 0; }
-            @Override public XSAttributeUse item(int index) { return null; }
+            @Override public XSObject item(int index) { return null; }
         };
     }
 
@@ -395,7 +394,7 @@ public class XmlToJsonXsdService {
             return arr;
         }
 
-        // Primitive via primitiveType/builtInKind (no getPrimitiveKind())
+        // Primitive via primitiveType/builtInKind
         short kind;
         XSSimpleTypeDefinition prim = t.getPrimitiveType();
         kind = (prim != null) ? prim.getBuiltInKind() : t.getBuiltInKind();
