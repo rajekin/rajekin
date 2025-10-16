@@ -1,16 +1,20 @@
-// src/main/java/com/example/convert/XmlToJsonXsltService.java
 package com.example.convert;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
-
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.*;
+import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathConstants;
+import javax.xml.xpath.XPathFactory;
 import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 @Service
@@ -23,12 +27,11 @@ public class XmlToJsonXsltService {
     try (InputStream xsl = new ClassPathResource("xslt/xml-to-json.xslt").getInputStream()) {
       TransformerFactory tf;
       try {
-        // Prefer Saxon if present (XSLT 2.0/3.0)
+        // Prefer Saxon (XSLT 3.0 -> enables parse-xml(), regex, etc.)
         tf = (TransformerFactory) Class.forName("net.sf.saxon.TransformerFactoryImpl")
-                .getDeclaredConstructor().newInstance();
+            .getDeclaredConstructor().newInstance();
       } catch (Throwable ignore) {
-        // Fallback to JDK (XSLT 1.0)
-        tf = TransformerFactory.newInstance();
+        tf = TransformerFactory.newInstance(); // XSLT 1.0 fallback
       }
       this.templates = tf.newTemplates(new StreamSource(xsl));
     } catch (Exception e) {
@@ -36,111 +39,62 @@ public class XmlToJsonXsltService {
     }
   }
 
-  /**
-   * Transform XML text to JSON text via XSLT.
-   * @param xml XML string
-   * @param params XSLT parameters: unwrap, parseCdata, flattenAttributes, coerceNumbers, etc.
-   * @param pretty pretty-print and validate JSON if true
-   */
   public String transform(String xml, Map<String, String> params, boolean pretty) throws Exception {
-    StringWriter out = new StringWriter();
-    Transformer t = templates.newTransformer();
-
-    if (params != null) {
-      for (Map.Entry<String, String> e : params.entrySet()) {
-        t.setParameter(e.getKey(), e.getValue());
-      }
+    // 1) Optional SOAP unwrap in Java (robust & fast)
+    if ("true".equalsIgnoreCase(params.getOrDefault("unwrap", "false"))) {
+      xml = extractSoapPayload(xml);  // returns the inner payload XML as a string
     }
 
+    // 2) Run the XSLT
+    StringWriter out = new StringWriter();
+    Transformer t = templates.newTransformer();
+    if (params != null) {
+      for (Map.Entry<String, String> e : params.entrySet()) t.setParameter(e.getKey(), e.getValue());
+    }
     try (Reader reader = new StringReader(xml)) {
       t.transform(new StreamSource(reader), new StreamResult(out));
     }
     String json = out.toString();
 
+    // 3) Optional: validate & pretty-print
     if (!pretty) return json;
-
-    // Validate & pretty-print
     ObjectWriter writer = mapper.writerWithDefaultPrettyPrinter();
     return writer.writeValueAsString(mapper.readTree(json));
   }
-}
 
+  /** Extracts the first child element of SOAP Body; returns original XML if not SOAP. */
+  private String extractSoapPayload(String soapXml) throws Exception {
+    DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+    dbf.setNamespaceAware(true);
+    Document doc = dbf.newDocumentBuilder().parse(new ByteArrayInputStream(soapXml.getBytes()));
+    XPath xp = XPathFactory.newInstance().newXPath();
+    // match Body regardless of prefix
+    Node body = (Node) xp.evaluate("/*[local-name()='Envelope']/*[local-name()='Body']",
+                                   doc, XPathConstants.NODE);
+    if (body == null || !body.hasChildNodes()) return soapXml;
 
-**********************
-
-    // src/main/java/com/example/convert/XmlToJsonXsltService.java
-package com.example.convert;
-
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.ObjectWriter;
-import org.springframework.core.io.ClassPathResource;
-import org.springframework.stereotype.Service;
-
-import javax.xml.transform.*;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
-
-@Service
-public class XmlToJsonXsltService {
-
-  private final Templates templates;
-  private final ObjectMapper mapper = new ObjectMapper();
-
-  public XmlToJsonXsltService() {
-    try (InputStream xsl = new ClassPathResource("xslt/xml-to-json.xslt").getInputStream()) {
-      TransformerFactory tf;
-      try {
-        // Prefer Saxon if present (XSLT 2.0/3.0)
-        tf = (TransformerFactory) Class.forName("net.sf.saxon.TransformerFactoryImpl")
-                .getDeclaredConstructor().newInstance();
-      } catch (Throwable ignore) {
-        // Fallback to JDK (XSLT 1.0)
-        tf = TransformerFactory.newInstance();
-      }
-      this.templates = tf.newTemplates(new StreamSource(xsl));
-    } catch (Exception e) {
-      throw new IllegalStateException("Failed to load XSLT stylesheet", e);
+    // Find first element child in Body
+    Node payload = null;
+    for (int i = 0; i < body.getChildNodes().getLength(); i++) {
+      Node n = body.getChildNodes().item(i);
+      if (n.getNodeType() == Node.ELEMENT_NODE) { payload = n; break; }
     }
-  }
+    if (payload == null) return soapXml;
 
-  /**
-   * Transform XML text to JSON text via XSLT.
-   * @param xml XML string
-   * @param params XSLT parameters: unwrap, parseCdata, flattenAttributes, coerceNumbers, etc.
-   * @param pretty pretty-print and validate JSON if true
-   */
-  public String transform(String xml, Map<String, String> params, boolean pretty) throws Exception {
-    StringWriter out = new StringWriter();
-    Transformer t = templates.newTransformer();
-
-    if (params != null) {
-      for (Map.Entry<String, String> e : params.entrySet()) {
-        t.setParameter(e.getKey(), e.getValue());
-      }
-    }
-
-    try (Reader reader = new StringReader(xml)) {
-      t.transform(new StreamSource(reader), new StreamResult(out));
-    }
-    String json = out.toString();
-
-    if (!pretty) return json;
-
-    // Validate & pretty-print
-    ObjectWriter writer = mapper.writerWithDefaultPrettyPrinter();
-    return writer.writeValueAsString(mapper.readTree(json));
+    // Serialize payload node back to a standalone XML string
+    Transformer tr = TransformerFactory.newInstance().newTransformer();
+    StringWriter sw = new StringWriter();
+    tr.transform(new DOMSource(payload), new StreamResult(sw));
+    return sw.toString();
   }
 }
-********************************************
-    // src/main/java/com/example/convert/XmlToJsonController.java
-package com.example.convert;
+****************************
+
+
+  package com.example.convert;
 
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
-
 import java.util.HashMap;
 import java.util.Map;
 
@@ -148,39 +102,32 @@ import java.util.Map;
 public class XmlToJsonController {
 
   private final XmlToJsonXsltService service;
+  public XmlToJsonController(XmlToJsonXsltService service){ this.service = service; }
 
-  public XmlToJsonController(XmlToJsonXsltService service) {
-    this.service = service;
-  }
-
-  /**
-   * POST the raw XML body. Options are passed as query params:
-   *   ?unwrap=true&parseCdata=true&flattenAttributes=false&coerceNumbers=true&pretty=true
-   */
   @PostMapping(
       path = "/convert/xml-to-json",
       consumes = MediaType.APPLICATION_XML_VALUE,
       produces = MediaType.APPLICATION_JSON_VALUE)
   public String convert(@RequestBody String xml,
-                        @RequestParam(defaultValue = "false") String unwrap,
-                        @RequestParam(defaultValue = "false") String parseCdata,
-                        @RequestParam(defaultValue = "false") String flattenAttributes,
-                        @RequestParam(defaultValue = "false") String coerceNumbers,
-                        @RequestParam(defaultValue = "true")  boolean pretty
-  ) throws Exception {
+                        @RequestParam(defaultValue="false") String unwrap,
+                        @RequestParam(defaultValue="false") String parseCdata,
+                        @RequestParam(defaultValue="false") String flattenAttributes,
+                        @RequestParam(defaultValue="false") String coerceNumbers,
+                        @RequestParam(defaultValue="true")  boolean pretty) throws Exception {
 
-    Map<String,String> xsltParams = new HashMap<>();
-    xsltParams.put("unwrap", unwrap);
-    xsltParams.put("parseCdata", parseCdata);
-    xsltParams.put("flattenAttributes", flattenAttributes);
-    xsltParams.put("coerceNumbers", coerceNumbers);
-
-    return service.transform(xml, xsltParams, pretty);
+    Map<String,String> p = new HashMap<>();
+    p.put("unwrap", unwrap);
+    p.put("parseCdata", parseCdata);
+    p.put("flattenAttributes", flattenAttributes);
+    p.put("coerceNumbers", coerceNumbers);
+    return service.transform(xml, p, pretty);
   }
 }
-****************************
 
-    <!-- src/main/resources/static/index.html -->
+**********************
+
+
+  <!-- src/main/resources/static/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -190,28 +137,28 @@ public class XmlToJsonController {
   <style>
     :root {
       --bg1:#0b1023; --bg2:#0f172a; --panel:#0c1426; --ink:#e7edf9; --muted:#9fb0c9;
-      --border: rgba(255,255,255,.08); --ring:#60f; --acc1:#22d3ee; --acc2:#8b5cf6;
+      --border: rgba(255,255,255,.08); --ring:#6050ff; --acc1:#22d3ee; --acc2:#8b5cf6;
+      --ok:#7ee787; --err:#ffb4ab; --warn:#ffd166;
     }
     *{box-sizing:border-box}
     html,body{height:100%}
     body{
-      margin:0; color:var(--ink); background: radial-gradient(1200px 600px at 15% -10%, #142044 10%, transparent 70%),
-                 radial-gradient(1400px 700px at 100% 0%, #1b0f35 5%, transparent 60%),
-                 linear-gradient(135deg, var(--bg1), var(--bg2));
-      font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Inter, system-ui, Helvetica, Arial;
+      margin:0; color:var(--ink);
+      background:
+        radial-gradient(1100px 550px at 10% -10%, #172659 12%, transparent 70%),
+        radial-gradient(1200px 600px at 100% 0%, #1b0f35 6%, transparent 60%),
+        linear-gradient(135deg, var(--bg1), var(--bg2));
+      font-family: ui-sans-serif, -apple-system, Segoe UI, Inter, Roboto, Helvetica, Arial;
       letter-spacing:.2px;
     }
     .nav {
       position: sticky; top:0; z-index:10;
-      display:flex; align-items:center; justify-content:space-between;
-      gap:16px; padding:16px 22px; backdrop-filter:saturate(140%) blur(8px);
-      background:linear-gradient(180deg, rgba(9, 11, 31,.75), rgba(9, 11, 31,.35));
+      display:flex; align-items:center; justify-content:space-between; gap:16px;
+      padding:16px 22px; backdrop-filter:saturate(140%) blur(8px);
+      background:linear-gradient(180deg, rgba(9,11,31,.75), rgba(9,11,31,.35));
       border-bottom:1px solid var(--border);
     }
-    .brand {
-      display:flex; align-items:center; gap:12px; font-weight:800; letter-spacing:.5px;
-      font-size:18px;
-    }
+    .brand { display:flex; align-items:center; gap:12px; font-weight:800; letter-spacing:.5px; font-size:18px; }
     .logo {
       width:28px; height:28px; border-radius:8px;
       background: conic-gradient(from 210deg, var(--acc1), var(--acc2) 40%, #36d399 75%, var(--acc1));
@@ -219,9 +166,7 @@ public class XmlToJsonController {
     }
     .badge { font-size:12px; color:var(--muted) }
     .container{max-width:1200px; margin:32px auto 56px; padding:0 20px}
-    .hero {
-      display:flex; justify-content:space-between; align-items:center; gap:20px; margin-bottom:16px;
-    }
+    .hero { display:flex; justify-content:space-between; align-items:center; gap:20px; margin-bottom:16px; }
     .hero h1 {margin:0; font-size:28px; font-weight:800; letter-spacing:.3px}
     .hero p {margin:6px 0 0; color:var(--muted); font-size:13px}
     .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px }
@@ -238,10 +183,10 @@ public class XmlToJsonController {
 
     textarea, pre {
       width:100%; min-height:420px; resize:vertical; border-radius:14px; border:1px solid var(--border);
-      background: #0a0f20; color:var(--ink); padding:12px 14px;
+      background:#0a0f20; color:var(--ink); padding:12px 14px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       font-size:13px; line-height:1.5;
-      outline: none; transition: box-shadow .2s, border-color .2s;
+      outline:none; transition: box-shadow .2s, border-color .2s;
     }
     textarea:focus { border-color: rgba(96,80,255,.7); box-shadow: 0 0 0 3px rgba(96,80,255,.25) }
     pre { margin:0; white-space:pre-wrap; word-break:break-word }
@@ -249,8 +194,7 @@ public class XmlToJsonController {
     .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top:12px }
     .chip {
       display:flex; align-items:center; gap:8px; padding:8px 12px; border-radius:999px;
-      background:#0a0f20; border:1px solid var(--border);
-      user-select:none;
+      background:#0a0f20; border:1px solid var(--border); user-select:none;
     }
     .chip input{transform:scale(1.1)}
     .btn {
@@ -261,18 +205,23 @@ public class XmlToJsonController {
     }
     .btn:active { transform: translateY(1px) }
     .btn[disabled]{opacity:.55; cursor:not-allowed}
-
     .toolbar { display:flex; align-items:center; gap:10px }
     .kbd { font: 600 11px ui-monospace, Menlo, monospace; padding:2px 6px; border-radius:6px;
       border:1px solid var(--border); color:var(--muted); background:#0a0f20 }
-    .status-ok { color:#7ee787 }
-    .status-err{ color:#ffb4ab }
+    .status { font-size:12px }
+    .status.ok{ color:var(--ok) }
+    .status.err{ color:var(--err) }
+    .right-actions { display:flex; gap:10px; align-items:center }
+    .ghost {
+      border:1px solid var(--border); background:#0a0f20; color:var(--ink);
+      padding:8px 12px; border-radius:999px; cursor:pointer; font-weight:600;
+    }
     .filepick { display:flex; align-items:center; gap:8px }
     input[type=file]::file-selector-button{
       border:none; border-radius:10px; padding:8px 12px; font-weight:600;
       background:#121a35; color:var(--ink); border:1px solid var(--border); cursor:pointer;
     }
-    footer { text-align:center; color:var(--muted); font-size:12px; margin-top:28px }
+    footer { text-align:center; color:var(--muted); font-size:12px; margin-top:10px }
   </style>
 </head>
 <body>
@@ -294,7 +243,11 @@ public class XmlToJsonController {
     <section class="hero">
       <div>
         <h1>Convert XML to JSON using your XSLT</h1>
-        <p>Paste XML or pick a file, toggle options, then convert. Output is validated & pretty-printed server-side.</p>
+        <p>Paste XML or pick a file. Toggle options for SOAP unwrapping, CDATA parsing, attribute flattening, and numeric coercion.</p>
+      </div>
+      <div class="right-actions">
+        <button id="loadSample" class="ghost" title="Load a sample SOAP message">Load Sample SOAP</button>
+        <button id="clearAll" class="ghost" title="Clear inputs and output">Clear</button>
       </div>
     </section>
 
@@ -309,13 +262,23 @@ public class XmlToJsonController {
         </div>
         <textarea id="xml" placeholder="&lt;CreditApplication&gt;…&lt;/CreditApplication&gt;"></textarea>
 
-        <div class="row">
-          <label class="chip"><input type="checkbox" id="unwrap"> <span>Unwrap XML</span></label>
-          <label class="chip"><input type="checkbox" id="parseCdata"> <span>Parse CDATA</span></label>
-          <label class="chip"><input type="checkbox" id="flattenAttributes"> <span>Flatten attributes</span></label>
-          <label class="chip"><input type="checkbox" id="coerceNumbers"> <span>Coerce numbers</span></label>
-          <label class="chip"><input type="checkbox" id="pretty" checked> <span>Pretty JSON</span></label>
-          <button class="btn" id="convertBtn">Convert</button>
+        <div class="row" role="group" aria-label="Options">
+          <label class="chip" title="Remove SOAP Envelope/Body and pass the first payload element to XSLT">
+            <input type="checkbox" id="unwrap"> <span>Unwrap SOAP</span>
+          </label>
+          <label class="chip" title="If a field contains embedded XML inside CDATA/text, parse it">
+            <input type="checkbox" id="parseCdata"> <span>Parse CDATA</span>
+          </label>
+          <label class="chip" title="Expose element attributes as JSON fields">
+            <input type="checkbox" id="flattenAttributes"> <span>Flatten attributes</span>
+          </label>
+          <label class="chip" title="Numbers/booleans/null emitted unquoted">
+            <input type="checkbox" id="coerceNumbers"> <span>Coerce numbers</span>
+          </label>
+          <label class="chip" title="Validate and pretty-print JSON on the server">
+            <input type="checkbox" id="pretty" checked> <span>Pretty JSON</span>
+          </label>
+          <button class="btn" id="convertBtn" title="Convert XML to JSON">Convert</button>
         </div>
       </section>
 
@@ -323,9 +286,12 @@ public class XmlToJsonController {
       <section class="card">
         <div class="bar">
           <label class="head">JSON output</label>
-          <span id="status" class="hint">Ready</span>
+          <span id="status" class="status">Ready</span>
         </div>
         <pre id="out" aria-live="polite"></pre>
+        <div class="row" style="justify-content: flex-end;">
+          <button id="copyBtn" class="ghost" title="Copy JSON to clipboard">Copy JSON</button>
+        </div>
         <footer>Tip: Press <span class="kbd">⌘/Ctrl</span> + <span class="kbd">Enter</span> to convert</footer>
       </section>
     </div>
@@ -333,7 +299,8 @@ public class XmlToJsonController {
 
   <script>
     const $ = id => document.getElementById(id);
-    const xmlEl = $('xml'), outEl = $('out'), statusEl = $('status'), fileEl = $('file'), btn = $('convertBtn');
+    const xmlEl = $('xml'), outEl = $('out'), statusEl = $('status'), fileEl = $('file');
+    const btn = $('convertBtn'), copyBtn = $('copyBtn'), sampleBtn = $('loadSample'), clearBtn = $('clearAll');
 
     fileEl.addEventListener('change', async (e) => {
       const f = e.target.files?.[0];
@@ -341,6 +308,11 @@ public class XmlToJsonController {
       xmlEl.value = await f.text();
       xmlEl.focus();
     });
+
+    function setStatus(text, kind){
+      statusEl.textContent = text;
+      statusEl.className = 'status ' + (kind || '');
+    }
 
     async function doConvert(){
       const xml = xmlEl.value.trim();
@@ -355,7 +327,7 @@ public class XmlToJsonController {
       });
 
       outEl.textContent = '';
-      statusEl.textContent = 'Converting…';
+      setStatus('Converting…','');
       btn.disabled = true;
       try {
         const res = await fetch('/convert/xml-to-json?' + params.toString(), {
@@ -366,11 +338,9 @@ public class XmlToJsonController {
         const text = await res.text();
         if (!res.ok) throw new Error(text || ('HTTP ' + res.status));
         outEl.textContent = text;
-        statusEl.textContent = 'Done';
-        statusEl.className = 'status-ok';
+        setStatus('Done','ok');
       } catch (err) {
-        statusEl.textContent = 'Error';
-        statusEl.className = 'status-err';
+        setStatus('Error','err');
         outEl.textContent = (err && err.message) ? err.message : String(err);
       } finally {
         btn.disabled = false;
@@ -386,6 +356,63 @@ public class XmlToJsonController {
         doConvert();
       }
     });
+
+    // Copy output
+    copyBtn.addEventListener('click', async () => {
+      const txt = outEl.textContent;
+      if (!txt) return;
+      try {
+        await navigator.clipboard.writeText(txt);
+        setStatus('Copied to clipboard','ok');
+        setTimeout(()=>setStatus('Ready',''), 1200);
+      } catch {
+        setStatus('Copy failed','err');
+      }
+    });
+
+    // Load a sample SOAP envelope
+    sampleBtn.addEventListener('click', () => {
+      xmlEl.value =
+`<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <CreditApplication>
+      <ApplicationNumber>12345</ApplicationNumber>
+      <Applicant>
+        <Name first="Raj" last="Rama">Raj Rama</Name>
+        <Age>36</Age>
+        <HasCoApplicant>false</HasCoApplicant>
+      </Applicant>
+      <Notes><![CDATA[<Extra><Flag>true</Flag><Score>712</Score></Extra>]]></Notes>
+      <Addresses>
+        <Address type="home"><Line1>123 Maple St</Line1><City>Aldie</City><State>VA</State></Address>
+        <Address type="work"><Line1>456 Oak Ave</Line1><City>Reston</City><State>VA</State></Address>
+      </Addresses>
+    </CreditApplication>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+      $('unwrap').checked = true;
+      $('parseCdata').checked = true;
+      $('flattenAttributes').checked = true;
+      $('coerceNumbers').checked = true;
+      xmlEl.focus();
+      setStatus('Sample loaded','');
+    });
+
+    // Clear
+    clearBtn.addEventListener('click', () => {
+      xmlEl.value = '';
+      outEl.textContent = '';
+      $('unwrap').checked = false;
+      $('parseCdata').checked = false;
+      $('flattenAttributes').checked = false;
+      $('coerceNumbers').checked = false;
+      $('pretty').checked = true;
+      fileEl.value = '';
+      setStatus('Ready','');
+      xmlEl.focus();
+    });
   </script>
 </body>
 </html>
+
