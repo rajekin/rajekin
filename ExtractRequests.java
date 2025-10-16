@@ -1,405 +1,167 @@
-package com.raj.utilities.service;
+package com.raj.utilities.web;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.*;
-import net.sf.saxon.jaxp.SaxonTransformerFactory;
-import org.springframework.stereotype.Service;
-import org.w3c.dom.*;
-import javax.xml.parsers.DocumentBuilder;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.Source;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
-import java.io.*;
-import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
-import java.util.*;
-
-@Service
-public class XmlToJsonUnifiedService {
-
-    public static final class Options {
-        // pre-processing
-        public boolean unwrapSoapBody = true;
-        public boolean parseCdataXml = true;
-        public boolean lowercaseRoot = false;
-
-        // attribute & text handling (for fallback XML->JSON path)
-        public boolean flattenAttributes = true;
-        public boolean coerceNumbers = true;
-
-        // XSLT mode
-        public boolean useXslt = false;
-        public String  xsltLocation = null;           // classpath:/xslt/xml-to-json.xsl or file:/...
-        public boolean xsltOutputIsJson = true;       // true: stylesheet emits JSON text; false: emits XML we will convert
-        public Map<String,String> xsltParams = Map.of(); // optional named params
-    }
-
-    public static final class Result {
-        public final String prettyJson;
-        public Result(String prettyJson) { this.prettyJson = prettyJson; }
-    }
-
-    private final ObjectMapper mapper = new ObjectMapper();
-
-    public Result convert(String xml, Options opt) throws Exception {
-        if (xml == null || xml.isBlank()) throw new IllegalArgumentException("XML input is empty.");
-        if (opt == null) opt = new Options();
-
-        // Parse original XML once (securely), we may reuse it
-        Document doc = buildSafeDocument(xml);
-        Element root = doc.getDocumentElement();
-
-        // Unwrap SOAP Envelope/Body if requested
-        if (opt.unwrapSoapBody && localName(root).equalsIgnoreCase("Envelope")) {
-            Optional<Element> body = firstByLocalName(root, "Body");
-            if (body.isPresent()) {
-                Optional<Element> payload = firstElementChild(body.get());
-                if (payload.isPresent()) root = payload.get();
-            }
-        }
-
-        // Promote top-level CDATA containing XML
-        if (opt.parseCdataXml) {
-            String inner = collectText(root).trim();
-            if (looksLikeXml(inner)) {
-                Document innerDoc = buildSafeDocument(inner);
-                root = innerDoc.getDocumentElement();
-            }
-        }
-
-        if (opt.useXslt) {
-            // Run XSLT against the (possibly unwrapped) fragment
-            String sourceXml = serializeElement(root);
-            String xsltOut = applyXslt(sourceXml, normalizeLocation(opt.xsltLocation), opt.xsltParams);
-
-            if (opt.xsltOutputIsJson) {
-                // Pretty-print JSON text returned by the stylesheet
-                JsonNode n = mapper.readTree(xsltOut);
-                return new Result(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(n));
-            } else {
-                // Stylesheet produced XML → convert to JSON using plain path
-                Document outDoc = buildSafeDocument(xsltOut);
-                Element outRoot = outDoc.getDocumentElement();
-                String finalRoot = opt.lowercaseRoot ? localName(outRoot).toLowerCase(Locale.ROOT) : localName(outRoot);
-                ObjectNode wrapper = mapper.createObjectNode();
-                JsonNode payload = elementToJsonPlain(outRoot, mapper.createObjectNode(), "/" + finalRoot, opt);
-                wrapper.set(finalRoot, payload);
-                return new Result(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(wrapper));
-            }
-        }
-
-        // No XSLT: do regular XML->JSON (plain) on the (possibly unwrapped) root
-        String outRootName = opt.lowercaseRoot ? localName(root).toLowerCase(Locale.ROOT) : localName(root);
-        ObjectNode out = mapper.createObjectNode();
-        out.set(outRootName, elementToJsonPlain(root, mapper.createObjectNode(), "/" + outRootName, opt));
-        return new Result(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(out));
-    }
-
-    /* ===================== XSLT ===================== */
-
-    private String applyXslt(String xml, String xsltLocation, Map<String,String> params) throws Exception {
-        if (xsltLocation == null || xsltLocation.isBlank())
-            throw new IllegalArgumentException("xsltLocation must be provided when useXslt=true");
-
-        // Saxon TransformerFactory
-        SaxonTransformerFactory tf = new SaxonTransformerFactory();
-        Source xslt = new StreamSource(resolve(xsltLocation));
-        Transformer t = tf.newTransformer(xslt);
-
-        if (params != null) {
-            for (Map.Entry<String,String> e : params.entrySet()) {
-                t.setParameter(e.getKey(), e.getValue());
-            }
-        }
-
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        t.transform(new StreamSource(new StringReader(xml)), new StreamResult(baos));
-        return baos.toString(StandardCharsets.UTF_8);
-    }
-
-    private static String normalizeLocation(String loc) {
-        if (loc == null || loc.isBlank()) return loc;
-        if (loc.startsWith("classpath:") || loc.startsWith("file:")) return loc;
-        return "classpath:" + (loc.startsWith("/") ? loc : "/" + loc);
-    }
-
-    private InputStream resolve(String location) throws Exception {
-        if (location.startsWith("classpath:")) {
-            String p = location.substring("classpath:".length());
-            InputStream in = XmlToJsonUnifiedService.class.getResourceAsStream(p.startsWith("/") ? p : "/" + p);
-            if (in == null) throw new IllegalArgumentException("Classpath resource not found: " + location);
-            return in;
-        }
-        if (location.startsWith("file:")) {
-            var uri = java.net.URI.create(location);
-            return java.nio.file.Files.newInputStream(java.nio.file.Paths.get(uri));
-        }
-        InputStream in = XmlToJsonUnifiedService.class.getResourceAsStream(location.startsWith("/") ? location : "/" + location);
-        if (in == null) throw new IllegalArgumentException("Classpath resource not found: " + location);
-        return in;
-    }
-
-    /* ===================== Plain XML → JSON (fallback or no-XSLT path) ===================== */
-
-    private JsonNode elementToJsonPlain(Element elem, ObjectNode target, String path, Options opt) throws Exception {
-        // attributes
-        NamedNodeMap attrs = elem.getAttributes();
-        if (attrs != null && attrs.getLength() > 0) {
-            for (int i = 0; i < attrs.getLength(); i++) {
-                Attr a = (Attr) attrs.item(i);
-                String key = a.getName(), val = a.getValue();
-                if (opt.flattenAttributes) {
-                    String slot = target.has(key) ? "_" + key : key;
-                    putValue(target, slot, val, opt.coerceNumbers);
-                } else {
-                    ObjectNode at = (ObjectNode) target.get("@attributes");
-                    if (at == null) at = target.putObject("@attributes");
-                    putValue(at, key, val, opt.coerceNumbers);
-                }
-            }
-        }
-
-        Map<String, List<Element>> groups = groupChildren(elem);
-        String rawText = collectText(elem).trim();
-
-        // inline CDATA that is XML
-        if (opt.parseCdataXml && looksLikeXml(rawText)) {
-            try {
-                Document inner = buildSafeDocument(rawText);
-                Element innerRoot = inner.getDocumentElement();
-                JsonNode innerJson = elementToJsonPlain(innerRoot, mapper.createObjectNode(),
-                        path + "/" + localName(innerRoot), opt);
-                target.set(localName(innerRoot), innerJson);
-                rawText = "";
-            } catch (Exception ignore) {}
-        }
-
-        if (groups.isEmpty()) {
-            if (target.size() == 0) {
-                return rawText.isEmpty() ? NullNode.instance : new TextNode(rawText);
-            } else {
-                if (!rawText.isEmpty()) putValue(target, "#text", rawText, opt.coerceNumbers);
-                return target;
-            }
-        }
-
-        // arrays by occurrence (plain policy)
-        for (Map.Entry<String, List<Element>> e : groups.entrySet()) {
-            String child = e.getKey();
-            List<Element> items = e.getValue();
-            if (items.size() == 1) {
-                target.set(child, elementToJsonPlain(items.get(0), mapper.createObjectNode(),
-                        path + "/" + child, opt));
-            } else {
-                ArrayNode arr = mapper.createArrayNode();
-                for (Element ce : items) {
-                    arr.add(elementToJsonPlain(ce, mapper.createObjectNode(),
-                            path + "/" + child, opt));
-                }
-                target.set(child, arr);
-            }
-        }
-
-        if (!rawText.isEmpty()) putValue(target, "#text", rawText, opt.coerceNumbers);
-        return target;
-    }
-
-    private static void putValue(ObjectNode node, String key, String raw, boolean coerceNumbers) {
-        if (!coerceNumbers || raw == null) { node.put(key, raw); return; }
-        String v = raw.trim();
-        if (v.isEmpty()) { node.put(key, v); return; }
-
-        try { // integer
-            String n = v.replace(",", "").replace("_", "");
-            if (n.matches("^[+-]?\\d+$")) { node.put(key, Long.parseLong(n)); return; }
-        } catch (Exception ignore) {}
-
-        try { // decimal
-            String n = v.replace(",", "").replace("%","").replace("$","");
-            if (n.matches("^[+-]?\\d*(\\.\\d+)?$") && n.matches(".*\\d.*")) {
-                node.put(key, new BigDecimal(n));
-                return;
-            }
-        } catch (Exception ignore) {}
-
-        if ("true".equalsIgnoreCase(v) || "false".equalsIgnoreCase(v)) { // boolean
-            node.put(key, Boolean.parseBoolean(v));
-            return;
-        }
-        node.put(key, raw);
-    }
-
-    /* ===================== DOM helpers ===================== */
-
-    private static Document buildSafeDocument(String xml) throws Exception {
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
-        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        dbf.setXIncludeAware(false);
-        dbf.setExpandEntityReferences(false);
-        DocumentBuilder db = dbf.newDocumentBuilder();
-        return db.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private static String serializeElement(Element elem) throws Exception {
-        // simple DOM -> string (UTF-8), without external libs
-        StringWriter sw = new StringWriter();
-        javax.xml.transform.Transformer id = javax.xml.transform.TransformerFactory.newInstance().newTransformer();
-        id.setOutputProperty("omit-xml-declaration", "yes");
-        id.transform(new javax.xml.transform.dom.DOMSource(elem), new javax.xml.transform.stream.StreamResult(sw));
-        return sw.toString();
-    }
-
-    private static String localName(Element e) {
-        return (e.getLocalName()!=null) ? e.getLocalName() : e.getNodeName();
-    }
-
-    private static Map<String, List<Element>> groupChildren(Element elem) {
-        Map<String, List<Element>> g = new LinkedHashMap<>();
-        NodeList nl = elem.getChildNodes();
-        for (int i = 0; i < nl.getLength(); i++) {
-            Node n = nl.item(i);
-            if (n instanceof Element) {
-                String ln = localName((Element) n);
-                g.computeIfAbsent(ln, k -> new ArrayList<>()).add((Element) n);
-            }
-        }
-        return g;
-    }
-
-    private static String collectText(Element e) {
-        StringBuilder sb = new StringBuilder();
-        NodeList nl = e.getChildNodes();
-        for (int i = 0; i < nl.getLength(); i++) {
-            Node n = nl.item(i);
-            if (n.getNodeType() == Node.TEXT_NODE || n.getNodeType() == Node.CDATA_SECTION_NODE) {
-                sb.append(n.getTextContent());
-            }
-        }
-        return sb.toString();
-    }
-
-    private static boolean looksLikeXml(String s) {
-        return s.startsWith("<") && s.endsWith(">") && s.contains("</");
-    }
-
-    private static Optional<Element> firstByLocalName(Element p, String ln) {
-        NodeList nl = p.getChildNodes();
-        for (int i = 0; i < nl.getLength(); i++) {
-            Node n = nl.item(i);
-            if (n instanceof Element) {
-                Element e = (Element) n;
-                if (ln.equalsIgnoreCase(localName(e))) return Optional.of(e);
-            }
-        }
-        return Optional.empty();
-    }
-
-    private static Optional<Element> firstElementChild(Element p) {
-        NodeList nl = p.getChildNodes();
-        for (int i = 0; i < nl.getLength(); i++) {
-            if (nl.item(i) instanceof Element) return Optional.of((Element) nl.item(i));
-        }
-        return Optional.empty();
-    }
-}
-**********************************************************************************
-
-
-  package com.raj.utilities.web;
-
-import com.raj.utilities.service.XmlToJsonUnifiedService;
-import com.raj.utilities.service.XmlToJsonUnifiedService.Options;
-import com.raj.utilities.service.XmlToJsonUnifiedService.Result;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.reactive.function.client.WebClient;
 
-import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
+import java.time.Duration;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/api/xml-to-json")
-public class XmlToJsonController {
+@RequestMapping("/api/fico")
+public class FicoProxyController {
 
-    private final XmlToJsonUnifiedService converter;
+    private final WebClient web;
+    private final String tokenUrl;
+    private final String scoreUrl;
+    private final String clientId;
+    private final String clientSecret;
 
-    public XmlToJsonController(XmlToJsonUnifiedService converter) {
-        this.converter = converter;
+    // NEW: header names / behavior for the secret-bearer token flow
+    private final String tokenAuthHeaderName;    // usually "Authorization"
+    private final String tokenAuthPrefix;        // usually "Bearer "
+    private final String tokenClientIdHeader;    // optional header for client id ("" to disable)
+
+    public FicoProxyController(
+            WebClient.Builder webBuilder,
+            @Value("${fico.auth.tokenUrl}") String tokenUrl,
+            @Value("${fico.api.scoreUrl}") String scoreUrl,
+            @Value("${fico.clientId}") String clientId,
+            @Value("${fico.clientSecret}") String clientSecret,
+            @Value("${fico.auth.headerToken.headerName:Authorization}") String tokenAuthHeaderName,
+            @Value("${fico.auth.headerToken.prefix:Bearer }") String tokenAuthPrefix,
+            @Value("${fico.auth.headerToken.clientIdHeader:}") String tokenClientIdHeader
+    ) {
+        this.web = webBuilder.build();
+        this.tokenUrl = tokenUrl;
+        this.scoreUrl = scoreUrl;
+        this.clientId = clientId;
+        this.clientSecret = clientSecret;
+        this.tokenAuthHeaderName = tokenAuthHeaderName;
+        this.tokenAuthPrefix = tokenAuthPrefix;
+        this.tokenClientIdHeader = tokenClientIdHeader;
     }
 
-    @Value("${raj.xml2json.xslt:classpath:/xslt/xml-to-json.xsl}")
-    private String defaultXslt;
+    // ... keep your original /api/fico/score method here if you want both flows ...
 
+    /**
+     * New flow:
+     *  1) Call tokenUrl with headers:
+     *     - Authorization: Bearer <clientSecret>   (configurable name/prefix)
+     *     - [optional] <tokenClientIdHeader>: <clientId>
+     *     Body is empty JSON by default (change if your server needs something else).
+     *  2) Extract token from JSON body or header.
+     *  3) Call scoreUrl with Authorization: Bearer <token> and the given request JSON.
+     */
     @PostMapping(
-        consumes = {
-            MediaType.TEXT_PLAIN_VALUE,
-            MediaType.APPLICATION_XML_VALUE,
-            MediaType.TEXT_XML_VALUE,
-            MediaType.APPLICATION_OCTET_STREAM_VALUE
-        },
+        path = "/score-secret",
+        consumes = MediaType.APPLICATION_JSON_VALUE,
         produces = MediaType.APPLICATION_JSON_VALUE
     )
-    public ResponseEntity<Map<String, Object>> convert(
-        @RequestBody byte[] body,
+    public ResponseEntity<?> scoreWithSecretBearer(@RequestBody String requestJson) {
+        try {
+            // 1) Get token with SECRET in header
+            WebClient.RequestBodySpec tokenReq = web.post()
+                    .uri(tokenUrl)
+                    .headers(h -> {
+                        h.add(tokenAuthHeaderName, tokenAuthPrefix + clientSecret);
+                        if (tokenClientIdHeader != null && !tokenClientIdHeader.isBlank()) {
+                            h.add(tokenClientIdHeader, clientId);
+                        }
+                        h.set(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE);
+                    })
+                    .contentType(MediaType.APPLICATION_JSON);
 
-        // pre-processing
-        @RequestParam(name = "unwrapSoapBody",    defaultValue = "true")  boolean unwrapSoapBody,
-        @RequestParam(name = "parseCdataXml",     defaultValue = "true")  boolean parseCdataXml,
-        @RequestParam(name = "lowercaseRoot",     defaultValue = "false") boolean lowercaseRoot,
+            // Some services require an empty body, some require {}.
+            var tokenResp = tokenReq
+                    .bodyValue("{}")
+                    .retrieve()
+                    .toEntity(String.class)
+                    .timeout(Duration.ofSeconds(30))
+                    .block();
 
-        // attributes / numbers for fallback XML->JSON
-        @RequestParam(name = "flattenAttributes", defaultValue = "true")  boolean flattenAttributes,
-        @RequestParam(name = "coerceNumbers",     defaultValue = "true")  boolean coerceNumbers,
+            if (tokenResp == null) throw new IllegalStateException("Empty token response");
 
-        // XSLT
-        @RequestParam(name = "useXslt",           defaultValue = "true")  boolean useXslt,
-        @RequestParam(name = "xsltPath",          required = false)       String xsltPath,
-        @RequestParam(name = "xsltOutputIsJson",  defaultValue = "true")  boolean xsltOutputIsJson
-    ) throws Exception {
+            // Extract token from header first (Authorization or X-Auth-Token), then from JSON body
+            String headerTok = tokenResp.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+            if (headerTok == null) headerTok = tokenResp.getHeaders().getFirst("X-Auth-Token");
+            String token = stripBearer(headerTok);
+            if (token == null) {
+                String body = tokenResp.getBody() == null ? "" : tokenResp.getBody().trim();
+                token = extractTokenFromBody(body);
+            }
+            if (token == null || token.isBlank()) throw new IllegalStateException("Token not found");
 
-        String xml = new String(body, StandardCharsets.UTF_8);
+            // 2) Call scoring API with token
+            String ficoResponse = web.post()
+                    .uri(scoreUrl)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .headers(h -> h.setBearerAuth(token))
+                    .bodyValue(requestJson)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .timeout(Duration.ofSeconds(30))
+                    .block();
 
-        Options opt = new Options();
-        opt.unwrapSoapBody = unwrapSoapBody;
-        opt.parseCdataXml = parseCdataXml;
-        opt.lowercaseRoot = lowercaseRoot;
-
-        opt.flattenAttributes = flattenAttributes;
-        opt.coerceNumbers = coerceNumbers;
-
-        opt.useXslt = useXslt;
-        opt.xsltLocation = (xsltPath != null && !xsltPath.isBlank()) ? xsltPath : defaultXslt;
-        opt.xsltOutputIsJson = xsltOutputIsJson;
-
-        // OPTIONAL: capture any request params prefixed with "p." as XSLT params
-        Map<String,String> xsltParams = new HashMap<>();
-        // Example: /api/xml-to-json?...&p_env=dev&p_flag=1  -> params env=dev, flag=1
-        // If you want this, you can parse from the native request (ServletRequest). Keeping it simple here.
-
-        opt.xsltParams = xsltParams;
-
-        Result res = converter.convert(xml, opt);
-        return ResponseEntity.ok(Map.of(
-            "json", res.prettyJson,
-            "viaXslt", useXslt
-        ));
+            return ResponseEntity.ok(Map.of(
+                    "requestSent", requestJson,
+                    "ficoResponse", ficoResponse
+            ));
+        } catch (Exception ex) {
+            return ResponseEntity.status(502).body(Map.of(
+                    "error", "FICO call failed",
+                    "message", ex.getMessage()
+            ));
+        }
     }
 
-    @GetMapping(path = "/health", produces = MimeTypeUtils.TEXT_PLAIN_VALUE)
-    public String health() { return "OK"; }
+    /* ------- tiny helpers ------- */
+    private static String stripBearer(String headerVal) {
+        if (headerVal == null) return null;
+        String s = headerVal.trim();
+        String lower = s.toLowerCase();
+        if (lower.startsWith("bearer ")) return s.substring(7).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String extractTokenFromBody(String body) {
+        if (body == null || body.isBlank()) return null;
+        // try JSON keys: token / access_token / accessToken
+        try {
+            var map = new com.fasterxml.jackson.databind.ObjectMapper().readValue(body, Map.class);
+            for (String k : new String[]{"token","access_token","accessToken"}) {
+                Object v = map.get(k);
+                if (v != null) return String.valueOf(v);
+            }
+            // nested data.token
+            Object data = map.get("data");
+            if (data instanceof Map) {
+                Map<?,?> dm = (Map<?,?>) data;
+                for (String k : new String[]{"token","access_token","accessToken"}) {
+                    Object v = dm.get(k);
+                    if (v != null) return String.valueOf(v);
+                }
+            }
+        } catch (Exception ignore) {
+            // not JSON → treat whole body as token
+            return body;
+        }
+        return null;
+    }
 }
-*****************************************************************************
-raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
-****************************************************************************
+************************************************
+
+
+
+# NEW (configurable header names/prefix for the token call)
+fico.auth.headerToken.headerName=Authorization
+fico.auth.headerToken.prefix=Bearer 
+fico.auth.headerToken.clientIdHeader=   # e.g., X-Client-Id (leave blank to skip)
+*************************************
 
 <!doctype html>
 <html lang="en">
@@ -429,7 +191,6 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
     .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:14px}
     .switch{display:flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);padding:8px 10px;border-radius:12px}
     .switch input[type="checkbox"]{width:16px;height:16px}
-    .select{display:flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);padding:8px 10px;border-radius:12px}
     .text{display:flex;align-items:center;gap:8px;background:var(--chip);border:1px solid var(--border);padding:8px 10px;border-radius:12px}
     .text input{border:none;outline:none;background:transparent;color:var(--fg);min-width:260px}
     .btn{padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:var(--btn);color:var(--btn-fg);cursor:pointer}
@@ -443,6 +204,7 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
     pre.code{white-space:pre-wrap;word-wrap:break-word;background:var(--codebg);color:var(--codefg);border-radius:14px;
       border:1px solid var(--border);padding:12px;min-height:420px;margin:0}
     .hint{color:var(--muted);font-size:.9em}
+    .row-actions{display:flex;gap:8px;flex-wrap:wrap}
   </style>
 </head>
 <body>
@@ -470,13 +232,17 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
       </label>
       <label class="switch"><input type="checkbox" id="xsltOutputIsJson" checked><span>Stylesheet outputs JSON</span></label>
 
-      <!-- Fallback XML→JSON options (only used when stylesheet outputs XML or XSLT disabled) -->
+      <!-- Fallback XML→JSON options (applies when stylesheet outputs XML or XSLT disabled) -->
       <label class="switch"><input type="checkbox" id="flatten" checked><span>Flatten attributes</span></label>
       <label class="switch"><input type="checkbox" id="coerce" checked><span>Coerce numbers</span></label>
 
-      <button id="convertBtn" class="btn">Convert</button>
-      <button id="clearBtn" class="btn secondary">Clear</button>
-      <span id="status" style="margin-left:auto;color:var(--muted)"></span>
+      <div class="row-actions" style="margin-left:auto">
+        <button id="convertBtn" class="btn">Convert</button>
+        <button id="sendFicoBtn" class="btn">Send to FICO</button>
+        <button id="sendFicoSecretBtn" class="btn">Send to FICO (Secret-Bearer)</button>
+        <button id="clearBtn" class="btn secondary">Clear</button>
+        <button id="copyBtn" class="btn secondary">Copy JSON</button>
+      </div>
     </div>
 
     <div class="grid">
@@ -490,42 +256,62 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
       <div>
         <div class="col-head">Output (JSON)</div>
         <pre id="json" class="code">/* JSON will appear here */</pre>
-        <div style="margin-top:10px;display:flex;gap:8px">
-          <button id="copyBtn" class="btn secondary" title="Copy JSON to clipboard">Copy JSON</button>
-        </div>
       </div>
     </div>
+
+    <div style="margin-top:18px">
+      <div class="col-head">FICO Response</div>
+      <pre id="ficoOut" class="code">/* FICO response will appear here */</pre>
+    </div>
+
+    <div class="hint" id="status" style="margin-top:10px"></div>
   </div>
 </div>
 
 <script>
   const $ = (id) => document.getElementById(id);
 
-  const xmlEl = $("xml"), jsonEl = $("json"), statusEl = $("status");
-  const btn = $("convertBtn");
+  const xmlEl = $("xml");
+  const jsonEl = $("json");
+  const ficoOutEl = $("ficoOut");
+  const statusEl = $("status");
 
-  const unwrapEl = $("unwrap"),
-        parseCdataEl = $("parseCdata"),
-        lowerRootEl = $("lowerRoot"),
-        useXsltEl = $("useXslt"),
-        xsltPathEl = $("xsltPath"),
-        xsltOutputIsJsonEl = $("xsltOutputIsJson"),
-        flattenEl = $("flatten"),
-        coerceEl = $("coerce");
+  const unwrapEl = $("unwrap");
+  const parseCdataEl = $("parseCdata");
+  const lowerRootEl = $("lowerRoot");
+  const useXsltEl = $("useXslt");
+  const xsltPathEl = $("xsltPath");
+  const xsltOutputIsJsonEl = $("xsltOutputIsJson");
+  const flattenEl = $("flatten");
+  const coerceEl = $("coerce");
 
-  $("clearBtn").addEventListener("click", () => {
-    xmlEl.value = ""; jsonEl.textContent = "/* JSON will appear here */";
+  const convertBtn = $("convertBtn");
+  const clearBtn = $("clearBtn");
+  const copyBtn = $("copyBtn");
+  const loadSampleBtn = $("loadSample");
+  const sendFicoBtn = $("sendFicoBtn");
+  const sendFicoSecretBtn = $("sendFicoSecretBtn");
+
+  function setStatus(msg){ statusEl.textContent = msg || ""; }
+
+  clearBtn.addEventListener("click", () => {
+    xmlEl.value = "";
+    jsonEl.textContent = "/* JSON will appear here */";
+    ficoOutEl.textContent = "/* FICO response will appear here */";
+    setStatus("");
   });
 
-  $("copyBtn").addEventListener("click", async () => {
+  copyBtn.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(jsonEl.textContent || "");
-      statusEl.textContent = "Copied!";
-      setTimeout(() => statusEl.textContent = "", 900);
-    } catch {}
+      setStatus("Copied JSON to clipboard.");
+      setTimeout(() => setStatus(""), 1000);
+    } catch {
+      setStatus("Copy failed.");
+    }
   });
 
-  $("loadSample").addEventListener("click", () => {
+  loadSampleBtn.addEventListener("click", () => {
     xmlEl.value =
 `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:inv="http://invoker.ps.example">
   <soapenv:Header/>
@@ -546,18 +332,19 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
   });
 
   useXsltEl.addEventListener("change", () => {
-    const enableXslt = useXsltEl.checked;
-    xsltPathEl.disabled = !enableXslt;
-    xsltOutputIsJsonEl.disabled = !enableXslt;
+    const enabled = useXsltEl.checked;
+    xsltPathEl.disabled = !enabled;
+    xsltOutputIsJsonEl.disabled = !enabled;
   });
+  useXsltEl.dispatchEvent(new Event("change"));
 
   async function convert() {
-    jsonEl.textContent = "";
     const xml = xmlEl.value.trim();
+    ficoOutEl.textContent = "/* FICO response will appear here */";
     if (!xml) { jsonEl.textContent = "Please paste some XML."; return; }
 
-    btn.disabled = true;
-    statusEl.textContent = "Converting…";
+    convertBtn.disabled = true;
+    setStatus("Converting…");
     try {
       const qs = new URLSearchParams({
         unwrapSoapBody: unwrapEl.checked,
@@ -575,26 +362,72 @@ raj.xml2json.xslt=classpath:/xslt/xml-to-json.xsl
         headers: { "Content-Type": "text/plain" },
         body: xml
       });
-      if (!resp.ok) throw new Error(await resp.text());
+      if (!resp.ok) {
+        const t = await resp.text().catch(()=> "");
+        throw new Error(t || ("HTTP " + resp.status));
+      }
       const data = await resp.json();
       jsonEl.textContent = data.json || JSON.stringify(data, null, 2);
+      setStatus("");
     } catch (e) {
       jsonEl.textContent = "Error: " + (e.message || e);
+      setStatus("Conversion failed.");
     } finally {
-      btn.disabled = false;
-      statusEl.textContent = "";
+      convertBtn.disabled = false;
     }
   }
 
-  btn.addEventListener("click", convert);
+  convertBtn.addEventListener("click", convert);
 
-  // Initialize control states
-  useXsltEl.dispatchEvent(new Event("change"));
+  function getJsonOrWarn() {
+    const text = (jsonEl.textContent || "").trim();
+    if (!text || text.startsWith("/*") || text.startsWith("Error")) {
+      ficoOutEl.textContent = "No JSON to send. Click Convert first.";
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      ficoOutEl.textContent = "The output panel does not contain valid JSON.";
+      return null;
+    }
+  }
+
+  async function sendToFico(endpoint) {
+    const payload = getJsonOrWarn();
+    if (!payload) return;
+
+    setStatus("Sending to FICO…");
+    ficoOutEl.textContent = "Sending…";
+    try {
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload)
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.message || JSON.stringify(data));
+      const pretty = typeof data.ficoResponse === "string"
+        ? tryPretty(data.ficoResponse)
+        : JSON.stringify(data.ficoResponse, null, 2);
+      ficoOutEl.textContent = pretty;
+      setStatus("");
+    } catch (e) {
+      ficoOutEl.textContent = "Error: " + (e.message || e);
+      setStatus("FICO call failed.");
+    }
+  }
+
+  sendFicoBtn.addEventListener("click", () => sendToFico("/api/fico/score"));
+  sendFicoSecretBtn.addEventListener("click", () => sendToFico("/api/fico/score-secret"));
+
+  function tryPretty(x) {
+    try { return JSON.stringify(JSON.parse(x), null, 2); } catch { return x; }
+  }
 </script>
 </body>
 </html>
 
-  
+    
 
-
-  
+    
