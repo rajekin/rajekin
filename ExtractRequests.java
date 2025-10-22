@@ -266,3 +266,71 @@ public class JiraStoryInfoAndDownloader {
 
         JsonNode getJson(String path) throws Exception {
             HttpGet get = new HttpGet(base + path);
+            get.addHeader(HttpHeaders.ACCEPT, "application/json");
+            return executeWithRetry(get, true);
+        }
+
+        void downloadToFile(String absoluteUrl, Path out) throws Exception {
+            HttpGet get = new HttpGet(absoluteUrl);
+            get.addHeader(HttpHeaders.ACCEPT, "application/octet-stream");
+            try (CloseableHttpResponse resp = http.execute(get)) {
+                int code = resp.getStatusLine().getStatusCode();
+                if (code != 200) {
+                    String body = safeBody(resp);
+                    throw new IOException("Download failed (" + code + "): " + body);
+                }
+                try (InputStream in = resp.getEntity().getContent()) {
+                    Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
+                }
+                EntityUtils.consumeQuietly(resp.getEntity());
+            }
+        }
+
+        private JsonNode executeWithRetry(HttpUriRequest req, boolean expectJson) throws Exception {
+            int attempts = 0;
+            while (true) {
+                attempts++;
+                try (CloseableHttpResponse resp = http.execute(req)) {
+                    int code = resp.getStatusLine().getStatusCode();
+                    if (code == 429 && attempts <= 5) {
+                        long backoff = parseRetryAfterMs(resp, 2000);
+                        System.err.println("429 rate-limited. Sleeping " + backoff + " ms (attempt " + attempts + ")");
+                        EntityUtils.consumeQuietly(resp.getEntity());
+                        Thread.sleep(backoff);
+                        continue;
+                    }
+                    if (code >= 200 && code < 300) {
+                        if (!expectJson) {
+                            EntityUtils.consumeQuietly(resp.getEntity());
+                            return null;
+                        }
+                        String body = safeBody(resp);
+                        return mapper.readTree(body);
+                    }
+                    String body = safeBody(resp);
+                    throw new IOException("HTTP " + code + " - " + body);
+                }
+            }
+        }
+
+        private static String safeBody(CloseableHttpResponse resp) throws IOException {
+            HttpEntity e = resp.getEntity();
+            String s = (e == null) ? "" : EntityUtils.toString(e);
+            EntityUtils.consumeQuietly(e);
+            return s;
+        }
+
+        private static long parseRetryAfterMs(CloseableHttpResponse resp, long defaultMs) {
+            Header h = resp.getFirstHeader("Retry-After");
+            if (h == null) return defaultMs;
+            String v = h.getValue().trim();
+            try {
+                return TimeUnit.SECONDS.toMillis(Long.parseLong(v));
+            } catch (NumberFormatException ignore) {
+                return defaultMs;
+            }
+        }
+
+        @Override public void close() throws Exception { http.close(); }
+    }
+}
