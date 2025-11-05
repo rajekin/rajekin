@@ -1,87 +1,51 @@
-
-
 package xmlUI;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
-public final class XmlFolderToJsonMain_NoArgs {
+public final class Utils {
 
-    // >>>>>>>>> EDIT THESE TWO LINES <<<<<<<<<
-    private static final String INPUT_DIR  = "C:\\work\\xmls";   // folder with .xml files
-    private static final String OUTPUT_DIR = "C:\\work\\out";    // where .json files go
+    // Edit these two paths
+    private static final String INPUT_DIR  = "C:\\work\\xmls";
+    private static final String OUTPUT_DIR = "C:\\work\\out";
 
-    // Optional XSLT use (leave false to use normal XML->JSON path)
-    private static final boolean USE_XSLT = false;
-    private static final String  XSLT_LOCATION = "classpath:xsl/xml-to-json.xsl"; // or "C:\\path\\to\\xml-to-json.xsl"
-
-    public static void main(String[] args) throws Exception {
+    public static void runFiles(XmlToJsonUnifiedService converter,
+                                XmlToJsonUnifiedService.Options opt) {
         Path inDir  = Paths.get(INPUT_DIR).toAbsolutePath().normalize();
         Path outDir = Paths.get(OUTPUT_DIR).toAbsolutePath().normalize();
 
-        if (!Files.isDirectory(inDir)) {
-            System.err.println("Input directory not found: " + inDir);
-            return;
+        try {
+            Files.createDirectories(outDir);
+            try (var walk = Files.walk(inDir)) {
+                walk.filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().toLowerCase().endsWith(".xml"))
+                    .forEach(xmlPath -> {
+                        try {
+                            String xml = new String(Files.readAllBytes(xmlPath), StandardCharsets.UTF_8);
+
+                            // <-- This uses XSLT as long as opt.useXslt==true and xsltLocation is set
+                            XmlToJsonUnifiedService.Result res = converter.convert(xml, opt);
+
+                            String base = xmlPath.getFileName().toString().replaceFirst("(?i)\\.xml$", "");
+                            Path out = outDir.resolve(base + ".json");
+
+                            writeAtomic(out, res.prettyJson);
+                            System.out.println("Saved (viaXSLT=" + opt.useXslt + "): " + out);
+                        } catch (Exception e) {
+                            System.err.println("Failed " + xmlPath + " :: " + e.getMessage());
+                        }
+                    });
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
-        Files.createDirectories(outDir);
-
-        // Set up your service + options (matches defaults from your class)
-        XmlToJsonUnifiedService svc = new XmlToJsonUnifiedService();
-        XmlToJsonUnifiedService.Options opt = new XmlToJsonUnifiedService.Options();
-        opt.unwrapSoapBody    = true;
-        opt.parseCdataXml     = true;
-        opt.lowercaseRoot     = true;
-        opt.flattenAttributes = true;
-        opt.coerceNumbers     = true;
-        opt.useXslt           = USE_XSLT;
-        opt.xsltLocation      = USE_XSLT ? XSLT_LOCATION : null;
-        opt.xsltOutputIsJson  = true;
-
-        AtomicInteger ok = new AtomicInteger();
-        AtomicInteger fail = new AtomicInteger();
-
-        // Walk the folder (recurses into subfolders; remove ".walk" and use ".list" for top-level only)
-        try (var paths = Files.walk(inDir)) {
-            paths.filter(Files::isRegularFile)
-                 .filter(XmlFolderToJsonMain_NoArgs::isXml)
-                 .forEach(xmlPath -> {
-                     try {
-                         String xml = readString(xmlPath);
-                         XmlToJsonUnifiedService.Result res = svc.convert(xml, opt);
-
-                         String base = xmlPath.getFileName().toString().replaceFirst("(?i)\\.xml$", "");
-                         Path outPath = outDir.resolve(base + ".json");
-
-                         writeAtomic(outPath, res.prettyJson);
-                         System.out.println("✓ " + inDir.relativize(xmlPath) + " -> " + outPath.getFileName());
-                         ok.incrementAndGet();
-                     } catch (Exception ex) {
-                         System.err.println("✗ " + xmlPath.getFileName() + " :: " + ex.getMessage());
-                         fail.incrementAndGet();
-                     }
-                 });
-        }
-
-        System.out.println("Done. Success: " + ok.get() + ", Failed: " + fail.get());
-        System.out.println("Output folder: " + outDir);
     }
 
-    private static boolean isXml(Path p) {
-        String name = p.getFileName().toString().toLowerCase();
-        return name.endsWith(".xml");
-    }
-
-    private static String readString(Path p) throws IOException {
-        byte[] bytes = Files.readAllBytes(p);
-        return new String(bytes, StandardCharsets.UTF_8);
-    }
-
-    private static void writeAtomic(Path out, String content) throws IOException {
+    private static void writeAtomic(Path out, String text) throws IOException {
         Path tmp = out.resolveSibling(out.getFileName().toString() + ".tmp");
-        Files.write(tmp, content.getBytes(StandardCharsets.UTF_8),
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Files.write(tmp, text.getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 }
