@@ -1,113 +1,94 @@
-// Extract only the application XML from SOAP
-String resp1BodyXml = extractSoapBodyXml(resp1Xml);                 // SOAP Body
-String appXml       = extractEmbeddedApplicationXml(resp1BodyXml);  // <inputxmlreturn>...</inputxmlreturn>
-
-// (Optional) save for debugging
-writeAtomic(fileOutDir.resolve(base + "-soap-application.xml"), appXml);
-
-// Now transform THAT XML to JSON
-String jsonFromResp1 = transformXmlToJson(xsltToJson, appXml);
-String jsonFromResp1Lower = lowercaseRootKey(jsonFromResp1);
+if (left.isArray()) {
+    diffArrayUnordered(path,
+        (com.fasterxml.jackson.databind.node.ArrayNode) left,
+        (com.fasterxml.jackson.databind.node.ArrayNode) right,
+        out);
+    return;
+}
 
 
+/** Order-insensitive, keyless array compare using canonical content signatures. */
+private static void diffArrayUnordered(JsonPointer path,
+                                       com.fasterxml.jackson.databind.node.ArrayNode leftArr,
+                                       com.fasterxml.jackson.databind.node.ArrayNode rightArr,
+                                       List<Diff> out) {
 
-// 2a) Pull the inner XML from <Envelope>/<Body>. If not SOAP, returns input as-is.
-private static String extractSoapBodyXml(String envelopeOrXml) {
-    try {
-        javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder();
-        org.w3c.dom.Document doc = db.parse(new org.xml.sax.InputSource(new java.io.StringReader(envelopeOrXml)));
+    // Fast path: both empty
+    if (leftArr.isEmpty() && rightArr.isEmpty()) return;
 
-        javax.xml.xpath.XPath xp = javax.xml.xpath.XPathFactory.newInstance().newXPath();
-        org.w3c.dom.Node body = (org.w3c.dom.Node) xp.evaluate(
-                "/*[local-name()='Envelope']/*[local-name()='Body']",
-                doc, javax.xml.xpath.XPathConstants.NODE);
+    // Group items by canonical signature (objects: fields sorted; arrays: children signatures sorted)
+    Map<String, Deque<JsonNode>> L = bagBySignature(leftArr);
+    Map<String, Deque<JsonNode>> R = bagBySignature(rightArr);
 
-        if (body == null) return envelopeOrXml; // plain XML, not a SOAP envelope
+    // Compare multiset of signatures
+    Set<String> sigs = new TreeSet<>();
+    sigs.addAll(L.keySet());
+    sigs.addAll(R.keySet());
 
-        // Serialize Body’s children back to XML
-        StringWriter out = new StringWriter();
-        javax.xml.transform.Transformer t = javax.xml.transform.TransformerFactory.newInstance().newTransformer();
-        for (int i = 0; i < body.getChildNodes().getLength(); i++) {
-            org.w3c.dom.Node child = body.getChildNodes().item(i);
-            if (child.getNodeType() == org.w3c.dom.Node.ELEMENT_NODE) {
-                t.transform(new javax.xml.transform.dom.DOMSource(child),
-                            new javax.xml.transform.stream.StreamResult(out));
-            }
+    for (String sig : sigs) {
+        Deque<JsonNode> ld = L.getOrDefault(sig, new ArrayDeque<>());
+        Deque<JsonNode> rd = R.getOrDefault(sig, new ArrayDeque<>());
+
+        // Pair as many as possible and recurse to surface inner differences
+        int matches = Math.min(ld.size(), rd.size());
+        for (int i = 0; i < matches; i++) {
+            JsonNode lItem = ld.pollFirst();
+            JsonNode rItem = rd.pollFirst();
+            diffJson(path, lItem, rItem, out);  // keep same base path; report shows values
         }
-        return out.toString();
-    } catch (Exception ignore) {
-        return envelopeOrXml;
+
+        // Leftovers = missing on the other side
+        while (!ld.isEmpty()) {
+            JsonNode n = ld.pollFirst();
+            out.add(new Diff(path.toString(), jsonPointerToXPath(path),
+                    DiffKind.MISSING_RIGHT, str(n), "∅"));
+        }
+        while (!rd.isEmpty()) {
+            JsonNode n = rd.pollFirst();
+            out.add(new Diff(path.toString(), jsonPointerToXPath(path),
+                    DiffKind.MISSING_LEFT, "∅", str(n)));
+        }
     }
 }
 
-// 2b) Find the element that carries the *stringified* application XML (e.g., <inputxmlreturn>),
-//     unwrap CDATA / &lt;...&gt; / &amp; entities, or if it’s already real XML, serialize that subtree.
-private static String extractEmbeddedApplicationXml(String bodyXml) {
-    try {
-        javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder();
-        org.w3c.dom.Document doc = db.parse(new org.xml.sax.InputSource(new java.io.StringReader(bodyXml)));
-
-        javax.xml.xpath.XPath xp = javax.xml.xpath.XPathFactory.newInstance().newXPath();
-
-        // Candidates that commonly hold the XML string
-        String expr =
-            "//*[local-name()='inputxmlreturn' or " +
-            "  local-name()='xmlreturn' or " +
-            "  local-name()='return' or " +
-            "  local-name()='result' or " +
-            "  local-name()='responseXml' or " +
-            "  local-name()='applicationXml' or " +
-            "  local-name()='application']";
-
-        org.w3c.dom.Node target = (org.w3c.dom.Node) xp.evaluate(expr, doc, javax.xml.xpath.XPathConstants.NODE);
-        if (target == null) {
-            // Fallback: first element whose text looks like embedded XML
-            target = (org.w3c.dom.Node) xp.evaluate("//*[contains(normalize-space(text()), '<') and contains(text(), '>')]",
-                                                    doc, javax.xml.xpath.XPathConstants.NODE);
-        }
-        if (target == null) {
-            // Last resort: return the whole body as-is
-            return bodyXml;
-        }
-
-        // If the target itself has element children, it’s already real XML → serialize that subtree
-        for (int i = 0; i < target.getChildNodes().getLength(); i++) {
-            if (target.getChildNodes().item(i).getNodeType() == org.w3c.dom.Node.ELEMENT_NODE) {
-                StringWriter out = new StringWriter();
-                javax.xml.transform.Transformer t = javax.xml.transform.TransformerFactory.newInstance().newTransformer();
-                t.transform(new javax.xml.transform.dom.DOMSource(target),
-                            new javax.xml.transform.stream.StreamResult(out));
-                return out.toString();
-            }
-        }
-
-        // Otherwise its textContent contains the XML as a STRING (possibly CDATA / &lt;...&gt;)
-        String s = target.getTextContent();
-        s = stripCdata(s.trim());
-        s = unescapeBasicXmlEntities(s.trim());
-        return s;
-    } catch (Exception e) {
-        return bodyXml; // fail open
+private static Map<String, Deque<JsonNode>> bagBySignature(com.fasterxml.jackson.databind.node.ArrayNode arr) {
+    Map<String, Deque<JsonNode>> m = new HashMap<>();
+    for (JsonNode n : arr) {
+        String sig = canonicalSignature(n);
+        m.computeIfAbsent(sig, k -> new ArrayDeque<>()).add(n);
     }
+    return m;
 }
 
-private static String stripCdata(String s) {
-    if (s == null) return "";
-    String t = s.trim();
-    if (t.startsWith("<![CDATA[")) t = t.substring(9);
-    if (t.endsWith("]]>")) t = t.substring(0, t.length() - 3);
-    return t;
+/** Deterministic, keyless, order-free signature. */
+private static String canonicalSignature(JsonNode n) {
+    if (n == null || n.isNull()) return "null";
+    if (n.isValueNode()) {
+        if (n.isNumber())
+            return "num:" + new java.math.BigDecimal(n.asText()).stripTrailingZeros().toPlainString();
+        if (n.isBoolean()) return "bool:" + n.asText();
+        return "str:" + n.asText();
+    }
+    if (n.isObject()) {
+        // sort fields by name, then sign each value
+        java.util.SortedMap<String,String> parts = new java.util.TreeMap<>();
+        n.fieldNames().forEachRemaining(fn -> parts.put(fn, canonicalSignature(n.get(fn))));
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String,String> e : parts.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append(escapeSig(e.getKey())).append(":").append(e.getValue());
+        }
+        return sb.append("}").toString();
+    }
+    // array: compute child signatures, then sort them so order doesn't matter
+    java.util.List<String> children = new java.util.ArrayList<>();
+    for (JsonNode c : n) children.add(canonicalSignature(c));
+    java.util.Collections.sort(children);
+    return "[" + String.join(",", children) + "]";
 }
 
-private static String unescapeBasicXmlEntities(String s) {
-    if (s == null) return "";
-    return s.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'");
+private static String escapeSig(String s) {
+    return s.replace("\\","\\\\").replace(":","\\:").replace(",","\\,");
 }
