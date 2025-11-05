@@ -2,23 +2,22 @@ package xmlUI;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpHeaders;
-import org.apache.http.client.config.RequestConfig;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.entity.ContentType;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.HttpHeaders;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+import org.apache.hc.core5.util.Timeout;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public final class JsonFolderRestCaller {
+public final class JsonFolderRestCaller_HC5 {
 
     // ====== EDIT THESE ======
     private static final String JSON_INPUT_DIR = "C:\\work\\json-in";
@@ -42,15 +41,17 @@ public final class JsonFolderRestCaller {
         }
         Files.createDirectories(outDir);
 
+        RequestConfig rc = RequestConfig.custom()
+                .setConnectTimeout(Timeout.ofSeconds(30))
+                .setResponseTimeout(Timeout.ofSeconds(60))
+                .build();
+
         try (CloseableHttpClient http = HttpClients.custom()
-                .setDefaultRequestConfig(RequestConfig.custom()
-                        .setConnectTimeout(30_000)
-                        .setSocketTimeout(60_000)
-                        .build())
+                .setDefaultRequestConfig(rc)
                 .build()) {
 
             String token = fetchBearerToken(http);
-            if (token == null || token.isEmpty()) {
+            if (token == null || token.isBlank()) {
                 System.err.println("Failed to acquire token; aborting.");
                 return;
             }
@@ -59,26 +60,26 @@ public final class JsonFolderRestCaller {
             AtomicInteger ok = new AtomicInteger();
             AtomicInteger fail = new AtomicInteger();
 
-            try (var stream = Files.walk(inDir)) {
-                stream.filter(Files::isRegularFile)
-                      .filter(JsonFolderRestCaller::isJson)
-                      .forEach(jsonPath -> {
-                          try {
-                              String reqJson = Files.readString(jsonPath, StandardCharsets.UTF_8);
-                              String respBody = postJsonWithBearer(http, REST_URL, reqJson, token);
+            try (var walk = Files.walk(inDir)) {
+                walk.filter(Files::isRegularFile)
+                    .filter(JsonFolderRestCaller_HC5::isJson)
+                    .forEach(jsonPath -> {
+                        try {
+                            String reqJson = readString(jsonPath);
+                            String respBody = postJsonWithBearer(http, REST_URL, reqJson, token);
 
-                              String base = baseName(jsonPath.getFileName().toString());
-                              boolean jsony = looksLikeJson(respBody);
-                              Path out = outDir.resolve(base + "-resp" + (jsony ? ".json" : ".txt"));
-                              writeAtomic(out, respBody == null ? "" : respBody);
+                            String base = baseName(jsonPath.getFileName().toString());
+                            boolean jsony = looksLikeJson(respBody);
+                            Path out = outDir.resolve(base + "-resp" + (jsony ? ".json" : ".txt"));
+                            writeAtomic(out, respBody == null ? "" : respBody);
 
-                              System.out.println("✓ " + jsonPath.getFileName() + " -> " + out.getFileName());
-                              ok.incrementAndGet();
-                          } catch (Exception e) {
-                              System.err.println("✗ " + jsonPath.getFileName() + " :: " + e.getMessage());
-                              fail.incrementAndGet();
-                          }
-                      });
+                            System.out.println("✓ " + jsonPath.getFileName() + " -> " + out.getFileName());
+                            ok.incrementAndGet();
+                        } catch (Exception e) {
+                            System.err.println("✗ " + jsonPath.getFileName() + " :: " + e.getMessage());
+                            fail.incrementAndGet();
+                        }
+                    });
             }
 
             System.out.println("Done. Success: " + ok.get() + ", Failed: " + fail.get());
@@ -86,65 +87,59 @@ public final class JsonFolderRestCaller {
         }
     }
 
-    // ---- HTTP helpers ----
-
+    // ---- Token: POST {"client":"..","secret":".."} ----
     private static String fetchBearerToken(CloseableHttpClient http) throws IOException {
         HttpPost post = new HttpPost(TOKEN_URL);
         post.setHeader(HttpHeaders.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType());
 
-        // body: {"client":"...","secret":"..."}
         String body = MAPPER.createObjectNode()
                 .put("client", CLIENT_ID)
                 .put("secret", CLIENT_SECRET)
                 .toString();
         post.setEntity(new StringEntity(body, ContentType.APPLICATION_JSON));
 
-        try (CloseableHttpResponse resp = http.execute(post)) {
-            int status = resp.getStatusLine().getStatusCode();
-            HttpEntity ent = resp.getEntity();
-            String respText = ent == null ? "" : EntityUtils.toString(ent, StandardCharsets.UTF_8);
+        return http.execute(post, response -> {
+            int status = response.getCode();
+            String text = response.getEntity() == null ? "" : EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
 
             if (status / 100 != 2) {
-                throw new IOException("Token HTTP " + status + ": " + respText);
+                throw new IOException("Token HTTP " + status + ": " + text);
             }
 
-            // Try common token field names
-            JsonNode node = safeParse(respText);
+            JsonNode node = safeParse(text);
             if (node != null) {
                 if (node.hasNonNull("access_token")) return node.get("access_token").asText();
                 if (node.hasNonNull("token"))        return node.get("token").asText();
                 if (node.hasNonNull("bearer"))       return node.get("bearer").asText();
                 if (node.hasNonNull("jwt"))          return node.get("jwt").asText();
-                // first string value fallback
-                for (JsonNode v : node) if (v.isTextual()) return v.asText();
+                for (JsonNode v : node) if (v.isTextual()) return v.asText(); // fallback
             }
-            // If token endpoint returns raw token string:
-            String trimmed = respText == null ? "" : respText.trim();
+            String trimmed = text == null ? "" : text.trim();
             if (!trimmed.isEmpty() && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-                return trimmed;
+                return trimmed; // raw token string
             }
             return null;
-        }
+        });
     }
 
+    // ---- Business POST with Bearer ----
     private static String postJsonWithBearer(CloseableHttpClient http, String url, String json, String token) throws IOException {
         HttpPost post = new HttpPost(url);
         post.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + token);
         post.setHeader(HttpHeaders.CONTENT_TYPE, ContentType.APPLICATION_JSON.getMimeType());
         post.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
 
-        try (CloseableHttpResponse resp = http.execute(post)) {
-            int status = resp.getStatusLine().getStatusCode();
-            String text = resp.getEntity() == null ? "" : EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+        return http.execute(post, response -> {
+            int status = response.getCode();
+            String text = response.getEntity() == null ? "" : EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
             if (status / 100 != 2) {
                 throw new IOException("REST HTTP " + status + ": " + text);
             }
             return text;
-        }
+        });
     }
 
-    // ---- file helpers ----
-
+    // ---- File helpers ----
     private static boolean isJson(Path p) {
         String n = p.getFileName().toString().toLowerCase();
         return n.endsWith(".json");
@@ -153,6 +148,11 @@ public final class JsonFolderRestCaller {
     private static String baseName(String fileName) {
         int i = fileName.lastIndexOf('.');
         return i >= 0 ? fileName.substring(0, i) : fileName;
+    }
+
+    private static String readString(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 
     private static void writeAtomic(Path out, String content) throws IOException {
@@ -172,56 +172,3 @@ public final class JsonFolderRestCaller {
         try { return MAPPER.readTree(s); } catch (Exception ignore) { return null; }
     }
 }
-
-
-*************************************
-
-
-    <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
-
-  <groupId>xmlUI</groupId>
-  <artifactId>json-folder-rest-caller</artifactId>
-  <version>1.0.0</version>
-
-  <properties>
-    <maven.compiler.source>1.8</maven.compiler.source>
-    <maven.compiler.target>1.8</maven.compiler.target>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <jackson.version>2.17.1</jackson.version>
-    <httpclient.version>4.5.14</httpclient.version>
-  </properties>
-
-  <dependencies>
-    <!-- Apache HttpClient (Java 8 compatible) -->
-    <dependency>
-      <groupId>org.apache.httpcomponents</groupId>
-      <artifactId>httpclient</artifactId>
-      <version>${httpclient.version}</version>
-    </dependency>
-
-    <!-- Jackson for JSON parsing -->
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
-  </dependencies>
-
-  <build>
-    <plugins>
-      <plugin>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
-        <configuration>
-          <source>${maven.compiler.source}</source>
-          <target>${maven.compiler.target}</target>
-          <encoding>${project.build.sourceEncoding}</encoding>
-        </configuration>
-      </plugin>
-    </plugins>
-  </build>
-</project>
