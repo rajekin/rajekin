@@ -1,36 +1,28 @@
-private static String postTextWithBearer(
-        CloseableHttpClient http,
-        String url,
-        String soapXml,
-        String token,
-        boolean soap12) throws IOException {
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
-    HttpPost post = new HttpPost(url);
+public class SoapCDataWrapper {
 
-    // Authorization header
-    post.setHeader("Authorization", "Bearer " + token);
-
-    // Content-Type decided entirely inside this method (no external constants)
-    if (soap12) {
-        // SOAP 1.2
-        post.setHeader("Content-Type", "application/soap+xml; charset=utf-8");
-    } else {
-        // SOAP 1.1
-        post.setHeader("Content-Type", "text/xml; charset=utf-8");
+    // Builds a SOAP 1.1 envelope with <inv:inputXml><![CDATA[...]]></inv:inputXml>
+    // Namespace/prefix match the screenshot.
+    public static String buildSoapBodyForInvoker(String rawXml) {
+        // CDATA cannot contain "]]>" — split it safely if it appears
+        String safe = rawXml.replace("]]>", "]]]]><![CDATA[>");
+        return ""
+            + "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\""
+            + " xmlns:inv=\"http://invoker.ps.eos.fairisaac.com\">"
+            + "<soapenv:Header/>"
+            + "<soapenv:Body>"
+            + "<inv:inputXml><![CDATA[" + safe + "]]></inv:inputXml>"
+            + "</soapenv:Body>"
+            + "</soapenv:Envelope>";
     }
 
-    // Request body
-    post.setEntity(new StringEntity(soapXml, java.nio.charset.StandardCharsets.UTF_8));
-
-    return http.execute(post, response -> {
-        int code = response.getCode();
-        String body = response.getEntity() == null
-                ? ""
-                : org.apache.hc.core5.http.io.entity.EntityUtils.toString(
-                        response.getEntity(), java.nio.charset.StandardCharsets.UTF_8);
-        if (code / 100 != 2) {
-            throw new IOException("SOAP HTTP " + code + ": " + body);
-        }
-        return body;
-    });
+    // Example: read your XML from a file and wrap it
+    public static void main(String[] args) throws Exception {
+        String xml = Files.readString(Path.of("your-input.xml"), StandardCharsets.UTF_8);
+        String soap = buildSoapBodyForInvoker(xml);
+        System.out.println(soap); // send this as the POST body
+    }
 }
