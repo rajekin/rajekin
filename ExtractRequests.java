@@ -1,74 +1,31 @@
+Path report = fileOutDir.resolve(base + "-diff-report.html");
+writeHtmlReport(report, base, diffs, left, right);
 
+private static void writeHtmlReport(Path htmlPath, String baseName,
+                                    List<Diff> diffs, JsonNode leftJson, JsonNode rightJson) throws IOException {
+    int missingLeft  = (int) diffs.stream().filter(d -> d.kind == DiffKind.MISSING_LEFT).count();
+    int missingRight = (int) diffs.stream().filter(d -> d.kind == DiffKind.MISSING_RIGHT).count();
+    int typeMismatch = (int) diffs.stream().filter(d -> d.kind == DiffKind.TYPE_MISMATCH).count();
+    int valueMismatch= (int) diffs.stream().filter(d -> d.kind == DiffKind.VALUE_MISMATCH).count();
 
-// If endpoint 2 sent XML/SOAP by mistake (e.g., error page), convert it to JSON
-String resp2Normalized = resp2Json;
-if (resp2Normalized != null && resp2Normalized.trim().startsWith("<")) {
-    String body2 = extractSoapBodyXml(resp2Normalized);     // handles plain XML or SOAP
-    resp2Normalized = lowercaseRootKey(transformXmlToJson(xsltToJson, body2));
-}
+    String title = "Diff Report • " + baseName;
+    String leftPretty  = prettyJsonOrRaw(leftJson);
+    String rightPretty = prettyJsonOrRaw(rightJson);
 
-JsonNode left  = parseJsonStrict(jsonFromResp1Lower, fileOutDir, base, "left");   // SOAP→XML→JSON
-JsonNode right = parseJsonStrict(resp2Normalized,    fileOutDir, base, "right");  // JSON (or XML converted)
-
-
-// Pulls the inner XML from <Envelope>/<Body> … if present; otherwise returns the input as-is.
-private static String extractSoapBodyXml(String envelopeOrXml) {
-    try {
-        javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(true);
-        javax.xml.parsers.DocumentBuilder db = dbf.newDocumentBuilder();
-        org.w3c.dom.Document doc = db.parse(new org.xml.sax.InputSource(new java.io.StringReader(envelopeOrXml)));
-
-        javax.xml.xpath.XPath xp = javax.xml.xpath.XPathFactory.newInstance().newXPath();
-        org.w3c.dom.Node body = (org.w3c.dom.Node) xp.evaluate(
-                "/*[local-name()='Envelope']/*[local-name()='Body']",
-                doc, javax.xml.xpath.XPathConstants.NODE);
-
-        if (body == null) return envelopeOrXml; // plain XML, no SOAP
-
-        // Serialize all Body children
-        StringWriter out = new StringWriter();
-        javax.xml.transform.Transformer t = javax.xml.transform.TransformerFactory.newInstance().newTransformer();
-        for (int i = 0; i < body.getChildNodes().getLength(); i++) {
-            org.w3c.dom.Node child = body.getChildNodes().item(i);
-            t.transform(new javax.xml.transform.dom.DOMSource(child),
-                        new javax.xml.transform.stream.StreamResult(out));
-        }
-        return out.toString();
-    } catch (Exception ignore) {
-        return envelopeOrXml; // fall back
-    }
-}
-
-// Normalizes and strictly parses JSON; writes a *_INVALID.json.txt file if it can’t parse.
-private static JsonNode parseJsonStrict(String raw, java.nio.file.Path fileOutDir, String base, String label) throws java.io.IOException {
-    String normalized = normalizeJsonText(raw);
-    try {
-        return MAPPER.readTree(normalized);
-    } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
-        java.nio.file.Path bad = fileOutDir.resolve(base + "-" + label + "-INVALID.json.txt");
-        String msg = "Parse error at line " + e.getLocation().getLineNr() + ", col " + e.getLocation().getColumnNr()
-                   + " :: " + e.getOriginalMessage() + "\n\n=== RAW ===\n" + raw;
-        java.nio.file.Files.writeString(bad, msg, java.nio.charset.StandardCharsets.UTF_8);
-        throw e;
-    }
-}
-
-private static String normalizeJsonText(String s) {
-    if (s == null) return "";
-    String t = stripUtf8Bom(s).trim();
-    // If server wrapped JSON as a quoted string: "\"{...}\""
-    if (t.startsWith("\"") && t.endsWith("\"")) {
-        try { t = MAPPER.readValue(t, String.class).trim(); } catch (Exception ignore) {}
-    }
-    // If there’s leading/trailing noise, keep only the outermost {} or []
-    int obj = t.indexOf('{'), arr = t.indexOf('[');
-    int start = (obj == -1) ? arr : (arr == -1 ? obj : Math.min(obj, arr));
-    int end = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'));
-    if (start >= 0 && end > start) t = t.substring(start, end + 1).trim();
-    return t;
-}
-
-private static String stripUtf8Bom(String s) {
-    return (s != null && !s.isEmpty() && s.charAt(0) == '\uFEFF') ? s.substring(1) : s;
-}
+    StringBuilder sb = new StringBuilder(64_000);
+    sb.append("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"/>")
+      .append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>")
+      .append("<title>").append(esc(title)).append("</title>")
+      // --- Minimal, clean CSS ---
+      .append("<style>")
+      .append("body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#0b0f14;color:#e6edf3}")
+      .append(".card{background:#0f1722;border:1px solid #1f2a3a;border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.35);}")
+      .append(".hdr{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:20px 22px;border-bottom:1px solid #1f2a3a}")
+      .append(".pill{padding:.25rem .6rem;border-radius:999px;font-size:.78rem;font-weight:600}")
+      .append(".ok{background:#12291a;color:#75f0a3;border:1px solid #1f6b3a}")
+      .append(".warn{background:#2b1a1a;color:#ffb4b4;border:1px solid #7a2e2e}")
+      .append(".muted{color:#9fb3c8}")
+      .append(".content{padding:18px 22px}")
+      .append("table{width:100%;border-collapse:separate;border-spacing:0 8px}")
+      .append("th{font-size:.85rem;color:#9fb3c8;text-align:left;padding:8px 10px}")
+      .append("td{background:#0b1420;bor
