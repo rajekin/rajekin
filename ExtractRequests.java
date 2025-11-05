@@ -1,28 +1,20 @@
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
-public class SoapCDataWrapper {
-
-    // Builds a SOAP 1.1 envelope with <inv:inputXml><![CDATA[...]]></inv:inputXml>
-    // Namespace/prefix match the screenshot.
-    public static String buildSoapBodyForInvoker(String rawXml) {
-        // CDATA cannot contain "]]>" — split it safely if it appears
-        String safe = rawXml.replace("]]>", "]]]]><![CDATA[>");
-        return ""
-            + "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\""
-            + " xmlns:inv=\"http://invoker.ps.eos.fairisaac.com\">"
-            + "<soapenv:Header/>"
-            + "<soapenv:Body>"
-            + "<inv:inputXml><![CDATA[" + safe + "]]></inv:inputXml>"
-            + "</soapenv:Body>"
-            + "</soapenv:Envelope>";
+HttpURLConnection conn = (HttpURLConnection) new URL(endpointUrl).openConnection();
+    conn.setRequestMethod("POST");
+    conn.setDoOutput(true);
+    conn.setRequestProperty("Content-Type",
+        soap12 ? "application/soap+xml; charset=utf-8" : "text/xml; charset=utf-8");
+    if (bearerToken != null && !bearerToken.isEmpty()) {
+        conn.setRequestProperty("Authorization", "Bearer " + bearerToken);
     }
 
-    // Example: read your XML from a file and wrap it
-    public static void main(String[] args) throws Exception {
-        String xml = Files.readString(Path.of("your-input.xml"), StandardCharsets.UTF_8);
-        String soap = buildSoapBodyForInvoker(xml);
-        System.out.println(soap); // send this as the POST body
+    try (OutputStream os = conn.getOutputStream()) {
+        os.write(soapXml.getBytes(StandardCharsets.UTF_8));
+    }
+    InputStream is = (conn.getResponseCode() >= 200 && conn.getResponseCode() < 300)
+        ? conn.getInputStream() : conn.getErrorStream();
+    try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+        StringBuilder sb = new StringBuilder(); String line;
+        while ((line = br.readLine()) != null) sb.append(line).append('\n');
+        return sb.toString();
     }
 }
