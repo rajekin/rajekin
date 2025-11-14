@@ -1,201 +1,248 @@
-if (left.isArray()) {
-    diffArrayUnorderedLoose(path,
-        (com.fasterxml.jackson.databind.node.ArrayNode) left,
-        (com.fasterxml.jackson.databind.node.ArrayNode) right,
-        out);
-    return;
-}
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
 
-// scalars (or any non-container values)
-if (!equalIgnoringType(left, right)) {
-    out.add(new Diff(path.toString(), jsonPointerToXPath(path),
-            DiffKind.VALUE_MISMATCH, str(left), str(right)));
-}
-return;
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>jar-decompiler-json-tool</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+
+    <properties>
+        <!-- Set your Java version here -->
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- CFR Java decompiler -->
+        <dependency>
+            <groupId>org.benf</groupId>
+            <artifactId>cfr</artifactId>
+            <version>0.152</version>
+        </dependency>
+
+        <!-- Jackson for JSON <-> POJO -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.17.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Compiler plugin -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <source>${maven.compiler.source}</source>
+                    <target>${maven.compiler.target}</target>
+                </configuration>
+            </plugin>
+
+            <!-- Make this a runnable jar if you want -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>JarDecompiler</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
 
 
-// ---------- knobs you can tweak ----------
-private static final boolean NORMALIZE_STRING_CASE = false; // true => "Approve" == "approve"
-private static final Set<String> IGNORE_FIELDS = java.util.Set.of(); // add noisy fields to ignore globally
-// ----------------------------------------
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.benf.cfr.reader.api.CfrDriver;
 
-// Type-agnostic equality (numbers vs numeric strings, bool vs "true"/"false", trimmed strings, null~missing)
-private static boolean equalIgnoringType(JsonNode a, JsonNode b) {
-    if (a == null && b == null) return true;
-    if (a == null || b == null) return false;
-    if (a.isMissingNode() && b.isNull()) return true;
-    if (b.isMissingNode() && a.isNull()) return true;
+import java.io.File;
+import java.io.IOException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
 
-    if (a.isContainerNode() || b.isContainerNode()) {
-        // handled elsewhere (objects/arrays recurse), this guard is for safety in case of odd calls
-        return a.toString().equals(b.toString());
-    }
+/**
+ * Usage:
+ *
+ *   mvn package
+ *   java -cp target/jar-decompiler-json-tool-1.0.0-SNAPSHOT.jar \
+ *        JarDecompiler path/to/your.jar path/to/input.json [fully.qualified.ClassName]
+ *
+ * - Decompiles ALL classes in the given JAR into ./decompiled-src
+ * - Lists all class names
+ * - Loads a class (either specified or the first one) from the JAR
+ * - Deserializes JSON from the given file into that class
+ * - Serializes the object back to JSON and prints it
+ */
+public class JarDecompiler {
 
-    // normalize both into the same canonical scalar form
-    String na = canonicalScalar(a);
-    String nb = canonicalScalar(b);
-    return java.util.Objects.equals(na, nb);
-}
-
-// Canonical scalar string for type-agnostic compare
-private static String canonicalScalar(JsonNode n) {
-    if (n == null || n.isMissingNode() || n.isNull()) return "∅";
-    if (n.isNumber()) {
-        try {
-            return "num:" + new java.math.BigDecimal(n.asText().trim())
-                    .stripTrailingZeros().toPlainString();
-        } catch (Exception e) { /* fall through to text */ }
-    }
-    if (n.isBoolean()) return "bool:" + (n.asBoolean() ? "true" : "false");
-
-    // textual → try number/bool first, else normalized text
-    String s = n.asText();
-    String t = s == null ? "" : s.trim();
-
-    // numeric string?
-    try {
-        java.math.BigDecimal bd = new java.math.BigDecimal(t);
-        return "num:" + bd.stripTrailingZeros().toPlainString();
-    } catch (Exception ignore) {}
-
-    // boolean string?
-    String tl = t.toLowerCase(java.util.Locale.ROOT);
-    if ("true".equals(tl) || "false".equals(tl)) return "bool:" + tl;
-
-    if (NORMALIZE_STRING_CASE) t = tl;
-    return "str:" + t;
-}
-
-// ---------- unordered, keyless, type-agnostic array diff ----------
-private static void diffArrayUnorderedLoose(JsonPointer path,
-        com.fasterxml.jackson.databind.node.ArrayNode leftArr,
-        com.fasterxml.jackson.databind.node.ArrayNode rightArr,
-        java.util.List<Diff> out) {
-
-    // Both empty
-    if (leftArr.size() == 0 && rightArr.size() == 0) return;
-
-    // If both are pure scalars → multiset on canonical scalars
-    if (allScalars(leftArr) && allScalars(rightArr)) {
-        multisetScalarLoose(path, leftArr, rightArr, out);
-        return;
-    }
-
-    // General case (objects/arrays/mixed): group by relaxed canonical signature
-    java.util.Map<String, java.util.Deque<JsonNode>> L = bagBySignatureLoose(leftArr);
-    java.util.Map<String, java.util.Deque<JsonNode>> R = bagBySignatureLoose(rightArr);
-
-    java.util.Set<String> sigs = new java.util.TreeSet<>();
-    sigs.addAll(L.keySet()); sigs.addAll(R.keySet());
-
-    for (String sig : sigs) {
-        java.util.Deque<JsonNode> ld = L.getOrDefault(sig, new java.util.ArrayDeque<>());
-        java.util.Deque<JsonNode> rd = R.getOrDefault(sig, new java.util.ArrayDeque<>());
-
-        // Pair up as many as possible (semantically same items)
-        int matches = Math.min(ld.size(), rd.size());
-        for (int i = 0; i < matches; i++) {
-            JsonNode li = ld.pollFirst();
-            JsonNode ri = rd.pollFirst();
-            // Recurse so inner field-level diffs still show if any
-            diffJson(path, li, ri, out);
+    public static void main(String[] args) throws Exception {
+        if (args.length < 2) {
+            System.out.println("Usage: java JarDecompiler <jar-path> <json-path> [fully.qualified.ClassName]");
+            System.out.println("  <jar-path>  : path to the JAR file whose classes will be decompiled");
+            System.out.println("  <json-path> : path to the JSON file to deserialize");
+            System.out.println("  [fqcn]      : optional fully qualified class name inside the JAR");
+            return;
         }
 
-        // Leftovers signal missing on the other side
-        while (!ld.isEmpty()) {
-            JsonNode n = ld.pollFirst();
-            out.add(new Diff(path.toString(), jsonPointerToXPath(path),
-                    DiffKind.MISSING_RIGHT, str(n), "∅"));
+        Path jarPath = Paths.get(args[0]);
+        Path jsonPath = Paths.get(args[1]);
+
+        if (!Files.exists(jarPath)) {
+            System.err.println("JAR not found: " + jarPath.toAbsolutePath());
+            return;
         }
-        while (!rd.isEmpty()) {
-            JsonNode n = rd.pollFirst();
-            out.add(new Diff(path.toString(), jsonPointerToXPath(path),
-                    DiffKind.MISSING_LEFT, "∅", str(n)));
+        if (!Files.exists(jsonPath)) {
+            System.err.println("JSON file not found: " + jsonPath.toAbsolutePath());
+            return;
         }
-    }
-}
 
-private static boolean allScalars(com.fasterxml.jackson.databind.node.ArrayNode a) {
-    for (JsonNode n : a) if (n.isContainerNode()) return false;
-    return true;
-}
+        // 1) Output directory for decompiled sources
+        Path outputDir = Paths.get("decompiled-src");
+        Files.createDirectories(outputDir);
 
-private static void multisetScalarLoose(JsonPointer path,
-        com.fasterxml.jackson.databind.node.ArrayNode leftArr,
-        com.fasterxml.jackson.databind.node.ArrayNode rightArr,
-        java.util.List<Diff> out) {
+        // 2) Decompile ALL classes from the JAR
+        System.out.println("Decompiling JAR: " + jarPath.toAbsolutePath());
+        decompileJarWithCfr(jarPath, outputDir);
+        System.out.println("Decompiled sources written under: " + outputDir.toAbsolutePath());
+        System.out.println();
 
-    java.util.Map<String, Integer> L = new java.util.HashMap<>();
-    java.util.Map<String, Integer> R = new java.util.HashMap<>();
-    java.util.Map<String, String> sample = new java.util.HashMap<>();
-
-    for (JsonNode n : leftArr) {
-        String k = canonicalScalar(n);
-        L.put(k, L.getOrDefault(k, 0) + 1);
-        sample.putIfAbsent(k, str(n));
-    }
-    for (JsonNode n : rightArr) {
-        String k = canonicalScalar(n);
-        R.put(k, R.getOrDefault(k, 0) + 1);
-        sample.putIfAbsent(k, str(n));
-    }
-
-    java.util.Set<String> keys = new java.util.TreeSet<>();
-    keys.addAll(L.keySet()); keys.addAll(R.keySet());
-
-    for (String k : keys) {
-        int lc = L.getOrDefault(k, 0), rc = R.getOrDefault(k, 0);
-        if (lc > rc) {
-            for (int i = 0; i < lc - rc; i++)
-                out.add(new Diff(path.toString(), jsonPointerToXPath(path),
-                        DiffKind.MISSING_RIGHT, sample.get(k), "∅"));
-        } else if (rc > lc) {
-            for (int i = 0; i < rc - lc; i++)
-                out.add(new Diff(path.toString(), jsonPointerToXPath(path),
-                        DiffKind.MISSING_LEFT, "∅", sample.get(k)));
+        // 3) List all class names inside the JAR
+        List<String> classNames = listClassesInJar(jarPath.toFile());
+        System.out.println("Classes found in JAR (" + classNames.size() + "):");
+        for (String cn : classNames) {
+            System.out.println("  " + cn);
         }
-    }
-}
+        System.out.println();
 
-// Group array items by a relaxed canonical signature (objects: fields sorted & values normalized; arrays: children signatures sorted)
-private static java.util.Map<String, java.util.Deque<JsonNode>> bagBySignatureLoose(com.fasterxml.jackson.databind.node.ArrayNode arr) {
-    java.util.Map<String, java.util.Deque<JsonNode>> m = new java.util.HashMap<>();
-    for (JsonNode n : arr) {
-        String sig = canonicalSignatureLoose(n);
-        m.computeIfAbsent(sig, k -> new java.util.ArrayDeque<>()).add(n);
-    }
-    return m;
-}
+        if (classNames.isEmpty()) {
+            System.err.println("No .class files found in the JAR.");
+            return;
+        }
 
-private static String canonicalSignatureLoose(JsonNode n) {
-    if (n == null || n.isNull() || n.isMissingNode()) return "null";
-
-    if (n.isValueNode()) return canonicalScalar(n); // already normalized with type-agnostic rules
-
-    if (n.isObject()) {
-        java.util.SortedMap<String,String> parts = new java.util.TreeMap<>();
-        n.fieldNames().forEachRemaining(fn -> {
-            if (!IGNORE_FIELDS.contains(fn)) {
-                parts.put(fn, canonicalSignatureLoose(n.get(fn)));
+        // 4) Decide which class to use for JSON binding
+        String fqcn;
+        if (args.length >= 3) {
+            fqcn = args[2];
+            if (!classNames.contains(fqcn)) {
+                System.out.println("Warning: specified class not found in JAR: " + fqcn);
+                System.out.println("         It may still load if it's an inner class or from another dependency.");
             }
-        });
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (java.util.Map.Entry<String,String> e : parts.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append(escapeSig(e.getKey())).append(":").append(e.getValue());
+        } else {
+            // default: first class found
+            fqcn = classNames.get(0);
+            System.out.println("No FQCN provided, using first class from JAR: " + fqcn);
         }
-        return sb.append("}").toString();
+
+        // 5) Load the class from the JAR
+        Class<?> clazz = loadClassFromJar(jarPath, fqcn);
+        System.out.println("Loaded class: " + clazz.getName());
+        System.out.println();
+
+        // 6) Read JSON from file
+        String json = Files.readString(jsonPath, StandardCharsets.UTF_8);
+        System.out.println("JSON read from file:");
+        System.out.println(json);
+        System.out.println();
+
+        // 7) Deserialize JSON into that class
+        Object obj = deserializeJsonToClass(json, clazz);
+        System.out.println("Deserialized instance type: " + obj.getClass().getName());
+
+        // 8) Serialize the object back to JSON
+        String backToJson = serializeClassToJson(obj);
+        System.out.println("Serialized back to JSON:");
+        System.out.println(backToJson);
     }
 
-    // array: normalize each child then sort so order doesn't matter
-    java.util.List<String> children = new java.util.ArrayList<>();
-    for (JsonNode c : n) children.add(canonicalSignatureLoose(c));
-    java.util.Collections.sort(children);
-    return "[" + String.join(",", children) + "]";
+    /**
+     * Use CFR to decompile the entire JAR into the given output directory.
+     */
+    public static void decompileJarWithCfr(Path jarPath, Path outputDir) {
+        Map<String, String> options = new HashMap<>();
+        // CFR will create package folders and .java files under this folder
+        options.put("outputdir", outputDir.toAbsolutePath().toString());
+
+        CfrDriver driver = new CfrDriver.Builder()
+                .withOptions(options)
+                .build();
+
+        // CFR takes a list of input "files" (jar/class)
+        driver.analyse(Collections.singletonList(jarPath.toAbsolutePath().toString()));
+    }
+
+    /**
+     * Extract fully qualified class names from a JAR file.
+     */
+    public static List<String> listClassesInJar(File jarFile) throws IOException {
+        List<String> classNames = new ArrayList<>();
+
+        try (JarFile jar = new JarFile(jarFile)) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+
+                String name = entry.getName();
+                if (name.endsWith(".class") && !entry.isDirectory()) {
+                    // Convert "com/example/MyClass.class" -> "com.example.MyClass"
+                    String className = name
+                            .replace('/', '.')
+                            .substring(0, name.length() - ".class".length());
+                    classNames.add(className);
+                }
+            }
+        }
+        return classNames;
+    }
+
+    /**
+     * Load a class from the given JAR using a URLClassLoader.
+     */
+    public static Class<?> loadClassFromJar(Path jarPath, String fqcn) throws Exception {
+        URL jarUrl = jarPath.toUri().toURL();
+        URL[] urls = { jarUrl };
+
+        ClassLoader parent = Thread.currentThread().getContextClassLoader();
+        URLClassLoader urlClassLoader = new URLClassLoader(urls, parent);
+
+        return Class.forName(fqcn, true, urlClassLoader);
+    }
+
+    /**
+     * Deserialize JSON into the given class type.
+     */
+    public static Object deserializeJsonToClass(String json, Class<?> clazz) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.readValue(json, clazz);
+    }
+
+    /**
+     * Serialize an object back to JSON.
+     */
+    public static String serializeClassToJson(Object obj) throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.writeValueAsString(obj);
+    }
 }
 
-private static String escapeSig(String s) {
-    return s.replace("\\","\\\\").replace(":","\\:").replace(",","\\,");
-}
+
+
+
+    
