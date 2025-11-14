@@ -1,68 +1,3 @@
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
-                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
-
-    <modelVersion>4.0.0</modelVersion>
-
-    <groupId>com.example</groupId>
-    <artifactId>jar-decompiler-json-tool</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
-
-    <properties>
-        <!-- Set your Java version here -->
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    </properties>
-
-    <dependencies>
-        <!-- CFR Java decompiler -->
-        <dependency>
-            <groupId>org.benf</groupId>
-            <artifactId>cfr</artifactId>
-            <version>0.152</version>
-        </dependency>
-
-        <!-- Jackson for JSON <-> POJO -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.17.0</version>
-        </dependency>
-    </dependencies>
-
-    <build>
-        <plugins>
-            <!-- Compiler plugin -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
-                <configuration>
-                    <source>${maven.compiler.source}</source>
-                    <target>${maven.compiler.target}</target>
-                </configuration>
-            </plugin>
-
-            <!-- Make this a runnable jar if you want -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-jar-plugin</artifactId>
-                <version>3.3.0</version>
-                <configuration>
-                    <archive>
-                        <manifest>
-                            <mainClass>JarDecompiler</mainClass>
-                        </manifest>
-                    </archive>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
-</project>
-
-
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.benf.cfr.reader.api.CfrDriver;
 
@@ -85,11 +20,10 @@ import java.util.jar.JarFile;
  *   java -cp target/jar-decompiler-json-tool-1.0.0-SNAPSHOT.jar \
  *        JarDecompiler path/to/your.jar path/to/input.json [fully.qualified.ClassName]
  *
- * - Decompiles ALL classes in the given JAR into ./decompiled-src
- * - Lists all class names
- * - Loads a class (either specified or the first one) from the JAR
- * - Deserializes JSON from the given file into that class
- * - Serializes the object back to JSON and prints it
+ * If [fully.qualified.ClassName] is NOT provided, the tool will:
+ *   - Try to find a class whose simple name is "Application"
+ *   - If found, use that
+ *   - Otherwise, fall back to the first class in the JAR
  */
 public class JarDecompiler {
 
@@ -140,15 +74,28 @@ public class JarDecompiler {
         // 4) Decide which class to use for JSON binding
         String fqcn;
         if (args.length >= 3) {
+            // If explicitly provided, just use that
             fqcn = args[2];
             if (!classNames.contains(fqcn)) {
                 System.out.println("Warning: specified class not found in JAR: " + fqcn);
                 System.out.println("         It may still load if it's an inner class or from another dependency.");
             }
         } else {
-            // default: first class found
-            fqcn = classNames.get(0);
-            System.out.println("No FQCN provided, using first class from JAR: " + fqcn);
+            // Try to find a class whose simple name is "Application"
+            String targetSimpleName = "Application";
+            Optional<String> applicationClass = classNames.stream()
+                    .filter(cn -> cn.equals(targetSimpleName) || cn.endsWith("." + targetSimpleName))
+                    .findFirst();
+
+            if (applicationClass.isPresent()) {
+                fqcn = applicationClass.get();
+                System.out.println("No FQCN provided. Found Application class: " + fqcn);
+            } else {
+                // Fallback: first class in the JAR
+                fqcn = classNames.get(0);
+                System.out.println("No FQCN provided and no Application class found.");
+                System.out.println("Using first class from JAR: " + fqcn);
+            }
         }
 
         // 5) Load the class from the JAR
@@ -184,7 +131,6 @@ public class JarDecompiler {
                 .withOptions(options)
                 .build();
 
-        // CFR takes a list of input "files" (jar/class)
         driver.analyse(Collections.singletonList(jarPath.toAbsolutePath().toString()));
     }
 
@@ -241,8 +187,3 @@ public class JarDecompiler {
         return mapper.writeValueAsString(obj);
     }
 }
-
-
-
-
-    
