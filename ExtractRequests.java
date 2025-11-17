@@ -1,4 +1,3 @@
-<!-- One element -> "name": value -->
 <xsl:template match="*">
     <!-- property name -->
     <xsl:text>"</xsl:text>
@@ -6,28 +5,16 @@
     <xsl:text>": </xsl:text>
 
     <xsl:choose>
-        <!-- Non-leaf (has children or attributes) – keep your existing object/array logic here -->
-        <xsl:when test="* or @*">
-            <!-- keep whatever you already had for complex elements -->
-            <xsl:call-template name="process-children"/>
+        <!-- EMPTY ELEMENT: no children, no attributes, no text -> JSON null -->
+        <xsl:when test="not(*) and not(@*) and normalize-space() = ''">
+            <xsl:text>null</xsl:text>
         </xsl:when>
 
-        <!-- Leaf element: no children, no attributes -->
+        <!-- NON-EMPTY: use your existing logic -->
         <xsl:otherwise>
-            <xsl:choose>
-                <!-- *** THIS IS THE IMPORTANT PART *** -->
-                <!-- If the element is empty or only whitespace -> JSON null -->
-                <xsl:when test="normalize-space() = ''">
-                    <xsl:text>null</xsl:text>
-                </xsl:when>
-
-                <!-- Otherwise, normal string value -->
-                <xsl:otherwise>
-                    <xsl:text>"</xsl:text>
-                    <xsl:value-of select="normalize-space()"/>
-                    <xsl:text>"</xsl:text>
-                </xsl:otherwise>
-            </xsl:choose>
+            <xsl:call-template name="process-children">
+                <xsl:with-param name="nodes" select="*"/>
+            </xsl:call-template>
         </xsl:otherwise>
     </xsl:choose>
 </xsl:template>
