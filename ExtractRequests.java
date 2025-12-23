@@ -3,32 +3,38 @@ import javax.xml.parsers.*;
 import java.io.*;
 import java.util.*;
 
-public class FsmlAnalyzerAllInOne {
+public class FsmlAnalyzerMain {
 
-    /* ===================== DATA ===================== */
+    /* ===================== DATA MODELS ===================== */
 
     static class Variable {
         String name;
         boolean numeric;
-        double min, max;
+        double min;
+        double max;
     }
 
     static class Interval {
         double min, max;
-        Interval(double a, double b) { min = a; max = b; }
+        Interval(double min, double max) {
+            this.min = min;
+            this.max = max;
+        }
         Interval intersect(Interval o) {
             double lo = Math.max(min, o.min);
             double hi = Math.min(max, o.max);
             return lo >= hi ? null : new Interval(lo, hi);
         }
-        public String toString() { return "["+min+","+max+")"; }
+        public String toString() {
+            return "[" + min + "," + max + ")";
+        }
     }
 
     static class Path {
         Map<String, Interval> numeric = new LinkedHashMap<>();
         Map<String, String> categorical = new LinkedHashMap<>();
         String action;
-        String leafTag;
+        String leafLabel;
 
         Path copy() {
             Path p = new Path();
@@ -41,43 +47,27 @@ public class FsmlAnalyzerAllInOne {
     static Map<String, Variable> variables = new HashMap<>();
     static List<Path> paths = new ArrayList<>();
 
-    /* ===================== GENERIC HELPERS ===================== */
+    /* ===================== XML HELPERS ===================== */
 
-    static boolean isDecisionNode(Element e) {
-        return e.getLocalName().equalsIgnoreCase("NODE");
-    }
-
-    static boolean isDecisionLeaf(Element e) {
-        return getDirectChild(e, "ACTIONS") != null
-            || getDirectChild(e, "ACTION") != null
-            || getDirectChild(e, "DECISION") != null;
-    }
-
-    static Element getDirectChild(Element parent, String localName) {
+    static List<Element> directChildren(Element parent, String localName) {
+        List<Element> out = new ArrayList<>();
         NodeList kids = parent.getChildNodes();
         for (int i = 0; i < kids.getLength(); i++) {
             if (kids.item(i) instanceof Element) {
                 Element e = (Element) kids.item(i);
                 if (localName.equalsIgnoreCase(e.getLocalName())) {
-                    return e;
+                    out.add(e);
                 }
             }
+        }
+        return out;
+    }
+
+    static Element directChild(Element parent, String localName) {
+        for (Element e : directChildren(parent, localName)) {
+            return e;
         }
         return null;
-    }
-
-    static List<Element> getDirectChildren(Element parent, String localName) {
-        List<Element> list = new ArrayList<>();
-        NodeList kids = parent.getChildNodes();
-        for (int i = 0; i < kids.getLength(); i++) {
-            if (kids.item(i) instanceof Element) {
-                Element e = (Element) kids.item(i);
-                if (localName.equalsIgnoreCase(e.getLocalName())) {
-                    list.add(e);
-                }
-            }
-        }
-        return list;
     }
 
     /* ===================== VARIABLE PARSING ===================== */
@@ -92,9 +82,11 @@ public class FsmlAnalyzerAllInOne {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.numeric = true;
-                Element r = getDirectChild(e, "NumericRange");
+
+                Element r = directChild(e, "NumericRange");
                 v.min = Double.parseDouble(r.getAttribute("minValue"));
                 v.max = Double.parseDouble(r.getAttribute("maxValue"));
+
                 variables.put(v.name, v);
             }
 
@@ -107,68 +99,91 @@ public class FsmlAnalyzerAllInOne {
         }
     }
 
-    /* ===================== GENERIC WALK ===================== */
+    /* ===================== FSML WALK ===================== */
 
-    static void walk(Element current, Path path) {
+    static void walk(Element node, Path incoming) {
 
-        Path next = path.copy();
+        Path current = incoming.copy();
 
-        // Apply DIRECT conditions
-        for (Element c : getDirectChildren(current, "CONDITION")) {
+        /* ---- Apply DIRECT CONDITIONS only ---- */
+        for (Element c : directChildren(node, "CONDITION")) {
+
             String key = c.getAttribute("DecisionKey");
             String type = c.getAttribute("Type");
             String val  = c.getAttribute("Value");
 
+            // Skip structural / grouping conditions
+            if (key == null || key.isBlank()) continue;
+            if (type == null || type.isBlank()) continue;
             if ("true".equalsIgnoreCase(type)) continue;
+            if ("and".equalsIgnoreCase(type)) continue;
+
             Variable v = variables.get(key);
             if (v == null) continue;
 
+            // ---- Numeric ----
             if (v.numeric) {
-                Interval base = next.numeric
+
+                // Skip missing / symbolic buckets
+                if (val == null || val.isBlank()) continue;
+                if ("NaN".equalsIgnoreCase(val)) continue;
+
+                Interval base = current.numeric
                         .getOrDefault(key, new Interval(v.min, v.max));
 
                 double num;
-                if ("LOW".equalsIgnoreCase(val)) num = v.min;
-                else if ("HIGH".equalsIgnoreCase(val)) num = v.max;
-                else num = Double.parseDouble(val);
+                if ("LOW".equalsIgnoreCase(val)) {
+                    num = v.min;
+                } else if ("HIGH".equalsIgnoreCase(val)) {
+                    num = v.max;
+                } else {
+                    num = Double.parseDouble(val);
+                }
 
-                Interval local = type.startsWith("g")
-                        ? new Interval(num, v.max)
-                        : new Interval(v.min, num);
+                Interval local;
+                if (type.startsWith("g")) {
+                    local = new Interval(num, v.max);
+                } else if (type.startsWith("l")) {
+                    local = new Interval(v.min, num);
+                } else {
+                    continue; // unknown operator
+                }
 
                 Interval merged = base.intersect(local);
-                if (merged == null) return;
+                if (merged == null) return; // dead path
 
-                next.numeric.put(key, merged);
+                current.numeric.put(key, merged);
+
             } else {
-                next.categorical.put(key, val);
+                // ---- Categorical ----
+                if (val != null && !val.isBlank()) {
+                    current.categorical.put(key, val);
+                }
             }
         }
 
-        // Leaf detection (DIRECT ONLY)
-        if (isDecisionLeaf(current)
-                && getDirectChildren(current, "NODE").isEmpty()) {
+        /* ---- Leaf detection: DIRECT ACTIONS only ---- */
+        Element actions = directChild(node, "ACTIONS");
+        List<Element> childNodes = directChildren(node, "NODE");
 
-            Element a = getDirectChild(current, "ACTIONS");
-            if (a == null) a = getDirectChild(current, "ACTION");
-            if (a == null) a = getDirectChild(current, "DECISION");
-
-            next.action = a != null ? a.getAttribute("Label") : "NO_ACTION";
-            next.leafTag = current.getAttribute("Label");
-            paths.add(next);
+        if (actions != null && childNodes.isEmpty()) {
+            current.action = actions.getAttribute("Label");
+            current.leafLabel = node.getAttribute("Label");
+            paths.add(current);
             return;
         }
 
-        // Recurse into direct NODE children
-        for (Element child : getDirectChildren(current, "NODE")) {
-            walk(child, next);
+        /* ---- Recurse into child NODEs ---- */
+        for (Element child : childNodes) {
+            walk(child, current);
         }
     }
 
     /* ===================== OUTPUT ===================== */
 
-    static void writeCsv() throws Exception {
+    static void writeDecisionTable() throws Exception {
         try (PrintWriter out = new PrintWriter("decision-table.csv")) {
+
             Set<String> cols = new LinkedHashSet<>();
             for (Path p : paths) {
                 cols.addAll(p.numeric.keySet());
@@ -184,10 +199,27 @@ public class FsmlAnalyzerAllInOne {
                         out.print(p.numeric.get(c) + ",");
                     else if (p.categorical.containsKey(c))
                         out.print(p.categorical.get(c) + ",");
-                    else out.print("-,");
+                    else
+                        out.print("-,");
                 }
                 out.println(p.action);
             }
+        }
+    }
+
+    static void writeHtml() throws Exception {
+        try (PrintWriter out = new PrintWriter("fsml-view.html")) {
+            out.println("<html><body><h2>FSML Decision Paths</h2><ul>");
+            for (Path p : paths) {
+                out.println("<li><b>" + p.leafLabel + "</b><ul>");
+                p.numeric.forEach((k,v) ->
+                        out.println("<li>"+k+" "+v+"</li>"));
+                p.categorical.forEach((k,v) ->
+                        out.println("<li>"+k+" = "+v+"</li>"));
+                out.println("<li><b>ACTION:</b> "+p.action+"</li>");
+                out.println("</ul></li>");
+            }
+            out.println("</ul></body></html>");
         }
     }
 
@@ -195,30 +227,48 @@ public class FsmlAnalyzerAllInOne {
 
     public static void main(String[] args) throws Exception {
 
+        File fsml = new File("model.fsml"); // <-- your FSML file
+
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(true);
-        Document doc = dbf.newDocumentBuilder()
-                .parse(new File("model.fsml"));
+
+        Document doc = dbf.newDocumentBuilder().parse(fsml);
         doc.getDocumentElement().normalize();
 
         parseVariables(doc);
 
-        // Find first NODE anywhere (generic root)
-        Element root = null;
+        // Locate STRATEGY
+        Element strategy = null;
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
             if (all.item(i) instanceof Element) {
                 Element e = (Element) all.item(i);
-                if ("NODE".equalsIgnoreCase(e.getLocalName())) {
-                    root = e;
+                if ("STRATEGY".equalsIgnoreCase(e.getLocalName())) {
+                    strategy = e;
                     break;
                 }
             }
         }
 
+        if (strategy == null) {
+            throw new RuntimeException("STRATEGY element not found");
+        }
+
+        // Root NODE
+        Element root = directChild(strategy, "NODE");
+        if (root == null) {
+            throw new RuntimeException("Root NODE not found");
+        }
+
         walk(root, new Path());
 
-        System.out.println("TOTAL PATHS = " + paths.size());
-        writeCsv();
+        System.out.println("TOTAL DECISION PATHS = " + paths.size());
+
+        writeDecisionTable();
+        writeHtml();
+
+        System.out.println("Generated:");
+        System.out.println(" - decision-table.csv");
+        System.out.println(" - fsml-view.html");
     }
 }
