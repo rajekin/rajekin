@@ -16,11 +16,17 @@ public class FsmlAnalyzerMain {
     static class Interval {
         double min, max;
         Interval(double min, double max) { this.min = min; this.max = max; }
+
+        boolean covers(Interval o) {
+            return min <= o.min && max >= o.max;
+        }
+
         Interval intersect(Interval o) {
             double lo = Math.max(min, o.min);
             double hi = Math.min(max, o.max);
             return lo >= hi ? null : new Interval(lo, hi);
         }
+
         public String toString() {
             return min + " <= x < " + max;
         }
@@ -30,13 +36,7 @@ public class FsmlAnalyzerMain {
         Map<String, Interval> numeric = new LinkedHashMap<>();
         Map<String, String> categorical = new LinkedHashMap<>();
         String action;
-
-        Path copy() {
-            Path p = new Path();
-            p.numeric.putAll(numeric);
-            p.categorical.putAll(categorical);
-            return p;
-        }
+        int id;
     }
 
     static Map<String, Variable> variables = new LinkedHashMap<>();
@@ -97,21 +97,18 @@ public class FsmlAnalyzerMain {
         }
     }
 
-    /* ===================== CONDITION EXTRACTION (FIX) ===================== */
+    /* ===================== CONDITION EXTRACTION ===================== */
 
-    static void extractConditions(Element cond, Path path) {
-
-        // Leaf condition
-        if (!children(cond, "CONDITION").isEmpty()) {
-            for (Element c : children(cond, "CONDITION")) {
-                extractConditions(c, path);
-            }
+    static void extractConditions(Element cond, Path p) {
+        List<Element> nested = children(cond, "CONDITION");
+        if (!nested.isEmpty()) {
+            for (Element c : nested) extractConditions(c, p);
             return;
         }
 
-        String key  = cond.getAttribute("DecisionKey");
+        String key = cond.getAttribute("DecisionKey");
         String type = cond.getAttribute("Type");
-        String val  = cond.getAttribute("Value");
+        String val = cond.getAttribute("Value");
 
         if (key.isEmpty() || type.isEmpty()) return;
         if ("true".equalsIgnoreCase(type) || "and".equalsIgnoreCase(type)) return;
@@ -122,7 +119,7 @@ public class FsmlAnalyzerMain {
         if (v.numeric) {
             if (val.isEmpty() || "NaN".equalsIgnoreCase(val)) return;
 
-            Interval base = path.numeric.getOrDefault(
+            Interval base = p.numeric.getOrDefault(
                     key, new Interval(v.min, v.max));
 
             double num =
@@ -135,70 +132,108 @@ public class FsmlAnalyzerMain {
                     : new Interval(v.min, num);
 
             Interval merged = base.intersect(local);
-            if (merged == null) throw new RuntimeException("Impossible path");
+            if (merged == null) return;
 
-            path.numeric.put(key, merged);
+            p.numeric.put(key, merged);
         } else {
-            path.categorical.put(key, val);
+            p.categorical.put(key, val);
         }
     }
 
-    /* ===================== TREE WALK ===================== */
+    /* ===================== WALK ===================== */
 
     static void walk(Element node, Path incoming) {
+        Path cur = new Path();
+        cur.numeric.putAll(incoming.numeric);
+        cur.categorical.putAll(incoming.categorical);
 
-        Path current = incoming.copy();
+        for (Element c : children(node, "CONDITION"))
+            extractConditions(c, cur);
 
-        for (Element c : children(node, "CONDITION")) {
-            extractConditions(c, current);
-        }
-
-        Element action = firstChild(node, "ACTIONS");
+        Element act = firstChild(node, "ACTIONS");
         List<Element> kids = children(node, "NODE");
 
-        if (action != null && kids.isEmpty()) {
-            current.action = action.getAttribute("Label");
-            paths.add(current);
+        if (act != null && kids.isEmpty()) {
+            cur.action = act.getAttribute("Label");
+            cur.id = paths.size() + 1;
+            paths.add(cur);
             return;
         }
 
-        for (Element k : kids) walk(k, current);
+        for (Element k : kids) walk(k, cur);
     }
 
-    /* ===================== OUTPUT ===================== */
+    /* ===================== GAP ANALYSIS ===================== */
 
-    static void writeDecisionTable() throws Exception {
-        PrintWriter out = new PrintWriter("decision-table.csv");
-        out.println("RULE,CONDITIONS,ACTION");
+    static void gapAnalysis() throws Exception {
+        PrintWriter out = new PrintWriter("gap-analysis.txt");
 
-        int r = 1;
-        for (Path p : paths) {
-            StringBuilder sb = new StringBuilder();
-            for (Map.Entry<String, Interval> e : p.numeric.entrySet())
-                sb.append(e.getKey()).append(" ").append(e.getValue()).append(" ; ");
-            for (Map.Entry<String, String> e : p.categorical.entrySet())
-                sb.append(e.getKey()).append(" = ").append(e.getValue()).append(" ; ");
+        for (Variable v : variables.values()) {
+            if (!v.numeric) continue;
 
-            out.println("R" + r++ + ",\"" + sb.toString().trim() + "\"," + p.action);
+            List<Interval> covered = new ArrayList<>();
+
+            for (Path p : paths) {
+                Interval i = p.numeric.get(v.name);
+                covered.add(i == null ? new Interval(v.min, v.max) : i);
+            }
+
+            covered.sort(Comparator.comparingDouble(a -> a.min));
+
+            double cursor = v.min;
+            boolean gap = false;
+
+            for (Interval c : covered) {
+                if (c.min > cursor) {
+                    out.println("GAP " + v.name + ": " + cursor + " → " + c.min);
+                    gap = true;
+                }
+                cursor = Math.max(cursor, c.max);
+            }
+
+            if (cursor < v.max) {
+                out.println("GAP " + v.name + ": " + cursor + " → " + v.max);
+                gap = true;
+            }
+
+            if (!gap) out.println("NO GAPS " + v.name);
+            out.println();
         }
         out.close();
     }
 
-    static void writeHtml() throws Exception {
-        PrintWriter out = new PrintWriter("fsml-view.html");
-        out.println("<html><body><h2>FSML Decision Paths</h2>");
+    /* ===================== SHADOWED PATHS ===================== */
 
-        int r = 1;
-        for (Path p : paths) {
-            out.println("<b>Rule " + (r++) + "</b><ul>");
-            for (Map.Entry<String, Interval> e : p.numeric.entrySet())
-                out.println("<li>" + e.getKey() + " " + e.getValue() + "</li>");
-            for (Map.Entry<String, String> e : p.categorical.entrySet())
-                out.println("<li>" + e.getKey() + " = " + e.getValue() + "</li>");
-            out.println("<li><b>ACTION:</b> " + p.action + "</li></ul><br/>");
+    static void detectShadowedPaths() throws Exception {
+        PrintWriter out = new PrintWriter("shadowed-paths.txt");
+
+        for (Path a : paths) {
+            for (Path b : paths) {
+                if (a == b) continue;
+                if (!a.action.equals(b.action)) continue;
+
+                boolean shadowed = true;
+
+                for (Map.Entry<String, Interval> e : a.numeric.entrySet()) {
+                    Interval bi = b.numeric.get(e.getKey());
+                    if (bi == null || !bi.covers(e.getValue())) {
+                        shadowed = false;
+                        break;
+                    }
+                }
+
+                for (Map.Entry<String, String> e : a.categorical.entrySet()) {
+                    if (!e.getValue().equals(b.categorical.get(e.getKey()))) {
+                        shadowed = false;
+                        break;
+                    }
+                }
+
+                if (shadowed) {
+                    out.println("Path " + b.id + " is shadowed by Path " + a.id);
+                }
+            }
         }
-
-        out.println("</body></html>");
         out.close();
     }
 
@@ -226,9 +261,12 @@ public class FsmlAnalyzerMain {
 
         walk(firstChild(strategy, "NODE"), new Path());
 
-        writeDecisionTable();
-        writeHtml();
+        gapAnalysis();
+        detectShadowedPaths();
 
         System.out.println("TOTAL PATHS = " + paths.size());
+        System.out.println("Generated:");
+        System.out.println(" gap-analysis.txt");
+        System.out.println(" shadowed-paths.txt");
     }
 }
