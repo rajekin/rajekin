@@ -15,17 +15,13 @@ public class FsmlAnalyzerMain {
 
     static class Interval {
         double min, max;
-        Interval(double min, double max) {
-            this.min = min; this.max = max;
-        }
+        Interval(double min, double max) { this.min = min; this.max = max; }
         Interval intersect(Interval o) {
             double lo = Math.max(min, o.min);
             double hi = Math.min(max, o.max);
             return lo >= hi ? null : new Interval(lo, hi);
         }
         public String toString() {
-            if (min == Double.NEGATIVE_INFINITY) return "< " + max;
-            if (max == Double.POSITIVE_INFINITY) return ">= " + min;
             return min + " <= x < " + max;
         }
     }
@@ -44,19 +40,31 @@ public class FsmlAnalyzerMain {
         }
     }
 
+    /* ===================== STATE ===================== */
+
     static Map<String, Variable> variables = new LinkedHashMap<>();
     static List<Path> paths = new ArrayList<>();
 
     /* ===================== XML HELPERS ===================== */
 
-    static List<Element> children(Element p, String name) {
+    // Handles namespaces safely
+    static String local(Node n) {
+        if (n.getLocalName() != null) return n.getLocalName();
+        String name = n.getNodeName();
+        int idx = name.indexOf(':');
+        return idx >= 0 ? name.substring(idx + 1) : name;
+    }
+
+    static List<Element> children(Element parent, String tag) {
         List<Element> list = new ArrayList<>();
-        NodeList nl = p.getChildNodes();
+        if (parent == null) return list;
+
+        NodeList nl = parent.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
             Node n = nl.item(i);
             if (n instanceof Element) {
                 Element e = (Element) n;
-                if (name.equalsIgnoreCase(e.getLocalName())) {
+                if (tag.equalsIgnoreCase(local(e))) {
                     list.add(e);
                 }
             }
@@ -64,12 +72,12 @@ public class FsmlAnalyzerMain {
         return list;
     }
 
-    static Element firstChild(Element p, String name) {
-        List<Element> list = children(p, name);
+    static Element firstChild(Element parent, String tag) {
+        List<Element> list = children(parent, tag);
         return list.isEmpty() ? null : list.get(0);
     }
 
-    /* ===================== VARIABLES ===================== */
+    /* ===================== VARIABLE PARSING ===================== */
 
     static void parseVariables(Document doc) {
         NodeList all = doc.getElementsByTagName("*");
@@ -78,17 +86,21 @@ public class FsmlAnalyzerMain {
             if (!(n instanceof Element)) continue;
             Element e = (Element) n;
 
-            if ("NumericKey".equalsIgnoreCase(e.getLocalName())) {
+            String name = local(e);
+
+            if ("NumericKey".equalsIgnoreCase(name)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.numeric = true;
                 Element r = firstChild(e, "NumericRange");
-                v.min = Double.parseDouble(r.getAttribute("minValue"));
-                v.max = Double.parseDouble(r.getAttribute("maxValue"));
+                if (r != null) {
+                    v.min = Double.parseDouble(r.getAttribute("minValue"));
+                    v.max = Double.parseDouble(r.getAttribute("maxValue"));
+                }
                 variables.put(v.name, v);
             }
 
-            if ("CategoricalKey".equalsIgnoreCase(e.getLocalName())) {
+            if ("CategoricalKey".equalsIgnoreCase(name)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.numeric = false;
@@ -100,6 +112,7 @@ public class FsmlAnalyzerMain {
     /* ===================== FSML WALK ===================== */
 
     static void walk(Element node, Path incoming) {
+        if (node == null) return;
 
         Path current = incoming.copy();
 
@@ -120,9 +133,10 @@ public class FsmlAnalyzerMain {
                 Interval base = current.numeric.getOrDefault(
                         key, new Interval(v.min, v.max));
 
-                double num = "LOW".equalsIgnoreCase(val) ? v.min :
-                             "HIGH".equalsIgnoreCase(val) ? v.max :
-                             Double.parseDouble(val);
+                double num =
+                        "LOW".equalsIgnoreCase(val) ? v.min :
+                        "HIGH".equalsIgnoreCase(val) ? v.max :
+                        Double.parseDouble(val);
 
                 Interval local = type.startsWith("g")
                         ? new Interval(num, v.max)
@@ -138,25 +152,24 @@ public class FsmlAnalyzerMain {
         }
 
         Element actions = firstChild(node, "ACTIONS");
-        List<Element> children = children(node, "NODE");
+        List<Element> kids = children(node, "NODE");
 
-        if (actions != null && children.isEmpty()) {
+        if (actions != null && kids.isEmpty()) {
             current.action = actions.getAttribute("Label");
             current.label = node.getAttribute("Label");
             paths.add(current);
             return;
         }
 
-        for (Element child : children) {
-            walk(child, current);
+        for (Element k : kids) {
+            walk(k, current);
         }
     }
 
-    /* ===================== DECISION TABLE ===================== */
+    /* ===================== OUTPUT ===================== */
 
     static void writeDecisionTable() throws Exception {
         PrintWriter out = new PrintWriter("decision-table.csv");
-
         out.print("RULE,");
         for (String v : variables.keySet()) out.print(v + ",");
         out.println("ACTION");
@@ -178,56 +191,8 @@ public class FsmlAnalyzerMain {
         out.close();
     }
 
-    /* ===================== GAP ANALYSIS (FIXED) ===================== */
-
-    static void writeGapAnalysis() throws Exception {
-        PrintWriter out = new PrintWriter("gap-analysis.txt");
-
-        for (Variable v : variables.values()) {
-            if (!v.numeric) continue;
-
-            List<Interval> covered = new ArrayList<>();
-
-            for (Path p : paths) {
-                Interval i = p.numeric.get(v.name);
-                if (i == null) {
-                    covered.add(new Interval(v.min, v.max)); // FULL coverage
-                } else {
-                    covered.add(i);
-                }
-            }
-
-            covered.sort(Comparator.comparingDouble(a -> a.min));
-
-            double cursor = v.min;
-            boolean gapFound = false;
-
-            for (Interval c : covered) {
-                if (c.min > cursor) {
-                    out.println("GAP in " + v.name + ": " + cursor + " to " + c.min);
-                    gapFound = true;
-                }
-                cursor = Math.max(cursor, c.max);
-            }
-
-            if (cursor < v.max) {
-                out.println("GAP in " + v.name + ": " + cursor + " to " + v.max);
-                gapFound = true;
-            }
-
-            if (!gapFound) {
-                out.println("NO GAPS in " + v.name);
-            }
-            out.println();
-        }
-        out.close();
-    }
-
-    /* ===================== HTML (TABLE-BASED) ===================== */
-
     static void writeHtml() throws Exception {
         PrintWriter out = new PrintWriter("fsml-view.html");
-
         out.println("<html><body><h2>Decision Table</h2><table border='1'>");
         out.print("<tr>");
         for (String v : variables.keySet()) out.print("<th>" + v + "</th>");
@@ -255,7 +220,8 @@ public class FsmlAnalyzerMain {
 
     public static void main(String[] args) throws Exception {
 
-        Document doc = DocumentBuilderFactory.newInstance()
+        Document doc = DocumentBuilderFactory
+                .newInstance()
                 .newDocumentBuilder()
                 .parse(new File("PenFed_AR_Expert_09042025.fsml"));
 
@@ -264,19 +230,30 @@ public class FsmlAnalyzerMain {
         Element strategy = null;
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
-            if (all.item(i) instanceof Element e &&
-                "STRATEGY".equalsIgnoreCase(e.getLocalName())) {
-                strategy = e;
-                break;
+            Node n = all.item(i);
+            if (n instanceof Element) {
+                Element e = (Element) n;
+                if ("STRATEGY".equalsIgnoreCase(local(e))) {
+                    strategy = e;
+                    break;
+                }
             }
         }
 
-        walk(firstChild(strategy, "NODE"), new Path());
+        if (strategy == null) {
+            throw new RuntimeException("No STRATEGY element found in FSML");
+        }
+
+        Element root = firstChild(strategy, "NODE");
+        if (root == null) {
+            throw new RuntimeException("No root NODE found under STRATEGY");
+        }
+
+        walk(root, new Path());
 
         writeDecisionTable();
-        writeGapAnalysis();
         writeHtml();
 
-        System.out.println("Paths: " + paths.size());
+        System.out.println("TOTAL PATHS = " + paths.size());
     }
 }
