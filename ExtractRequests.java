@@ -5,42 +5,30 @@ import java.util.*;
 
 public class FsmlAnalyzerAllInOne {
 
-    /* ===================== MODELS ===================== */
+    /* ===================== DATA ===================== */
 
     static class Variable {
         String name;
-        String type; // NUMERIC / CATEGORICAL
-        double min;
-        double max;
-        Set<String> categories = new HashSet<>();
-    }
-
-    static class Condition {
-        String key;
-        String op;
-        String value;
+        boolean numeric;
+        double min, max;
     }
 
     static class Interval {
         double min, max;
-        Interval(double min, double max) {
-            this.min = min; this.max = max;
-        }
+        Interval(double a, double b) { min = a; max = b; }
         Interval intersect(Interval o) {
             double lo = Math.max(min, o.min);
             double hi = Math.min(max, o.max);
-            return (lo >= hi) ? null : new Interval(lo, hi);
+            return lo >= hi ? null : new Interval(lo, hi);
         }
-        public String toString() {
-            return "[" + min + "," + max + ")";
-        }
+        public String toString() { return "["+min+","+max+")"; }
     }
 
     static class Path {
         Map<String, Interval> numeric = new LinkedHashMap<>();
         Map<String, String> categorical = new LinkedHashMap<>();
         String action;
-        String leafLabel;
+        String leafTag;
 
         Path copy() {
             Path p = new Path();
@@ -53,20 +41,58 @@ public class FsmlAnalyzerAllInOne {
     static Map<String, Variable> variables = new HashMap<>();
     static List<Path> paths = new ArrayList<>();
 
-    /* ===================== PARSER ===================== */
+    /* ===================== GENERIC HELPERS ===================== */
+
+    static boolean isDecisionNode(Element e) {
+        return e.getLocalName().equalsIgnoreCase("NODE");
+    }
+
+    static boolean isDecisionLeaf(Element e) {
+        return getDirectChild(e, "ACTIONS") != null
+            || getDirectChild(e, "ACTION") != null
+            || getDirectChild(e, "DECISION") != null;
+    }
+
+    static Element getDirectChild(Element parent, String localName) {
+        NodeList kids = parent.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            if (kids.item(i) instanceof Element) {
+                Element e = (Element) kids.item(i);
+                if (localName.equalsIgnoreCase(e.getLocalName())) {
+                    return e;
+                }
+            }
+        }
+        return null;
+    }
+
+    static List<Element> getDirectChildren(Element parent, String localName) {
+        List<Element> list = new ArrayList<>();
+        NodeList kids = parent.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            if (kids.item(i) instanceof Element) {
+                Element e = (Element) kids.item(i);
+                if (localName.equalsIgnoreCase(e.getLocalName())) {
+                    list.add(e);
+                }
+            }
+        }
+        return list;
+    }
+
+    /* ===================== VARIABLE PARSING ===================== */
 
     static void parseVariables(Document doc) {
-        NodeList keys = doc.getElementsByTagName("*");
-        for (int i = 0; i < keys.getLength(); i++) {
-            Node n = keys.item(i);
-            if (!(n instanceof Element)) continue;
-            Element e = (Element) n;
+        NodeList all = doc.getElementsByTagName("*");
+        for (int i = 0; i < all.getLength(); i++) {
+            if (!(all.item(i) instanceof Element)) continue;
+            Element e = (Element) all.item(i);
 
             if ("NumericKey".equalsIgnoreCase(e.getLocalName())) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
-                v.type = "NUMERIC";
-                Element r = (Element) e.getElementsByTagName("NumericRange").item(0);
+                v.numeric = true;
+                Element r = getDirectChild(e, "NumericRange");
                 v.min = Double.parseDouble(r.getAttribute("minValue"));
                 v.max = Double.parseDouble(r.getAttribute("maxValue"));
                 variables.put(v.name, v);
@@ -75,84 +101,73 @@ public class FsmlAnalyzerAllInOne {
             if ("CategoricalKey".equalsIgnoreCase(e.getLocalName())) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
-                v.type = "CATEGORICAL";
-                NodeList cats = e.getElementsByTagName("CATEGORY");
-                for (int j = 0; j < cats.getLength(); j++) {
-                    v.categories.add(((Element) cats.item(j)).getAttribute("Value"));
-                }
+                v.numeric = false;
                 variables.put(v.name, v);
             }
         }
     }
 
-    /* ===================== TREE WALK ===================== */
+    /* ===================== GENERIC WALK ===================== */
 
-    static void walk(Element node, Path current) {
+    static void walk(Element current, Path path) {
 
-        Path next = current.copy();
+        Path next = path.copy();
 
-        NodeList kids = node.getChildNodes();
+        // Apply DIRECT conditions
+        for (Element c : getDirectChildren(current, "CONDITION")) {
+            String key = c.getAttribute("DecisionKey");
+            String type = c.getAttribute("Type");
+            String val  = c.getAttribute("Value");
 
-        for (int i = 0; i < kids.getLength(); i++) {
-            Node n = kids.item(i);
-            if (!(n instanceof Element)) continue;
-            Element e = (Element) n;
+            if ("true".equalsIgnoreCase(type)) continue;
+            Variable v = variables.get(key);
+            if (v == null) continue;
 
-            if ("CONDITION".equalsIgnoreCase(e.getLocalName())) {
-                String key = e.getAttribute("DecisionKey");
-                String type = e.getAttribute("Type");
-                String val  = e.getAttribute("Value");
+            if (v.numeric) {
+                Interval base = next.numeric
+                        .getOrDefault(key, new Interval(v.min, v.max));
 
-                if ("true".equalsIgnoreCase(type)) continue;
+                double num;
+                if ("LOW".equalsIgnoreCase(val)) num = v.min;
+                else if ("HIGH".equalsIgnoreCase(val)) num = v.max;
+                else num = Double.parseDouble(val);
 
-                Variable v = variables.get(key);
-                if (v == null) continue;
+                Interval local = type.startsWith("g")
+                        ? new Interval(num, v.max)
+                        : new Interval(v.min, num);
 
-                if ("NUMERIC".equals(v.type)) {
-                    Interval base = next.numeric
-                            .getOrDefault(key, new Interval(v.min, v.max));
+                Interval merged = base.intersect(local);
+                if (merged == null) return;
 
-                    double num;
-                    if ("LOW".equals(val)) num = v.min;
-                    else if ("HIGH".equals(val)) num = v.max;
-                    else num = Double.parseDouble(val);
-
-                    Interval local = type.startsWith("g")
-                            ? new Interval(num, v.max)
-                            : new Interval(v.min, num);
-
-                    Interval merged = base.intersect(local);
-                    if (merged == null) return;
-
-                    next.numeric.put(key, merged);
-                } else {
-                    next.categorical.put(key, val);
-                }
+                next.numeric.put(key, merged);
+            } else {
+                next.categorical.put(key, val);
             }
         }
 
-        // Leaf
-        if (node.getElementsByTagName("ACTIONS").getLength() > 0) {
-            Element a = (Element) node.getElementsByTagName("ACTIONS").item(0);
-            next.action = a.getAttribute("Label");
-            next.leafLabel = node.getAttribute("Label");
+        // Leaf detection (DIRECT ONLY)
+        if (isDecisionLeaf(current)
+                && getDirectChildren(current, "NODE").isEmpty()) {
+
+            Element a = getDirectChild(current, "ACTIONS");
+            if (a == null) a = getDirectChild(current, "ACTION");
+            if (a == null) a = getDirectChild(current, "DECISION");
+
+            next.action = a != null ? a.getAttribute("Label") : "NO_ACTION";
+            next.leafTag = current.getAttribute("Label");
             paths.add(next);
             return;
         }
 
-        // Recurse children
-        for (int i = 0; i < kids.getLength(); i++) {
-            Node n = kids.item(i);
-            if (n instanceof Element
-                    && "NODE".equalsIgnoreCase(((Element) n).getLocalName())) {
-                walk((Element) n, next);
-            }
+        // Recurse into direct NODE children
+        for (Element child : getDirectChildren(current, "NODE")) {
+            walk(child, next);
         }
     }
 
     /* ===================== OUTPUT ===================== */
 
-    static void writeDecisionTable() throws Exception {
+    static void writeCsv() throws Exception {
         try (PrintWriter out = new PrintWriter("decision-table.csv")) {
             Set<String> cols = new LinkedHashSet<>();
             for (Path p : paths) {
@@ -169,25 +184,10 @@ public class FsmlAnalyzerAllInOne {
                         out.print(p.numeric.get(c) + ",");
                     else if (p.categorical.containsKey(c))
                         out.print(p.categorical.get(c) + ",");
-                    else
-                        out.print("-,");
+                    else out.print("-,");
                 }
                 out.println(p.action);
             }
-        }
-    }
-
-    static void writeHtml() throws Exception {
-        try (PrintWriter out = new PrintWriter("fsml-view.html")) {
-            out.println("<html><body><h2>FSML Decision Paths</h2><ul>");
-            for (Path p : paths) {
-                out.println("<li><b>" + p.leafLabel + "</b><ul>");
-                p.numeric.forEach((k,v)->out.println("<li>"+k+" "+v+"</li>"));
-                p.categorical.forEach((k,v)->out.println("<li>"+k+"="+v+"</li>"));
-                out.println("<li><b>ACTION:</b> "+p.action+"</li>");
-                out.println("</ul></li>");
-            }
-            out.println("</ul></body></html>");
         }
     }
 
@@ -198,36 +198,27 @@ public class FsmlAnalyzerAllInOne {
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
         dbf.setNamespaceAware(true);
         Document doc = dbf.newDocumentBuilder()
-                .parse(new File("model.fsml")); // <-- your file
+                .parse(new File("model.fsml"));
         doc.getDocumentElement().normalize();
 
         parseVariables(doc);
 
-        Element strategy = null;
+        // Find first NODE anywhere (generic root)
+        Element root = null;
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
-            Element e = (Element) all.item(i);
-            if ("STRATEGY".equalsIgnoreCase(e.getLocalName())) {
-                strategy = e;
-                break;
-            }
-        }
-
-        Element root = null;
-        NodeList kids = strategy.getChildNodes();
-        for (int i = 0; i < kids.getLength(); i++) {
-            if (kids.item(i) instanceof Element
-                    && "NODE".equalsIgnoreCase(((Element) kids.item(i)).getLocalName())) {
-                root = (Element) kids.item(i);
-                break;
+            if (all.item(i) instanceof Element) {
+                Element e = (Element) all.item(i);
+                if ("NODE".equalsIgnoreCase(e.getLocalName())) {
+                    root = e;
+                    break;
+                }
             }
         }
 
         walk(root, new Path());
 
-        System.out.println("TOTAL DECISION PATHS = " + paths.size());
-
-        writeDecisionTable();
-        writeHtml();
+        System.out.println("TOTAL PATHS = " + paths.size());
+        writeCsv();
     }
 }
