@@ -2,9 +2,6 @@ import java.util.*;
 
 public class FsmlModel {
 
-    public Map<String, Variable> variables = new HashMap<>();
-    public List<RuleNode> nodes = new ArrayList<>();
-
     public static class Variable {
         public String name;
         public String type; // NUMERIC / CATEGORICAL
@@ -13,30 +10,37 @@ public class FsmlModel {
         public Set<String> categories = new HashSet<>();
     }
 
-    public static class RuleNode {
-        public String label;
-        public Map<String, List<Condition>> conditions = new HashMap<>();
-        public String action;
-    }
-
     public static class Condition {
         public String variable;
         public String operator; // ge, gt, lt, le, eq
         public String value;
     }
+
+    public static class Node {
+        public String label;
+        public List<Condition> conditions = new ArrayList<>();
+        public List<Node> children = new ArrayList<>();
+        public String action;
+    }
+
+    public Map<String, Variable> variables = new HashMap<>();
+    public Node root;
 }
 
 
-
-public class NumericInterval {
+public class Interval {
     public double start;
     public double end;
-    public String source;
 
-    public NumericInterval(double start, double end, String source) {
-        this.start = start;
-        this.end = end;
-        this.source = source;
+    public Interval(double s, double e) {
+        this.start = s;
+        this.end = e;
+    }
+
+    public Interval intersect(Interval other) {
+        double s = Math.max(start, other.start);
+        double e = Math.min(end, other.end);
+        return (s < e) ? new Interval(s, e) : null;
     }
 
     public boolean contains(double v) {
@@ -47,13 +51,20 @@ public class NumericInterval {
 
 
 
-
 import java.util.*;
 
-public class GapAnalysisResult {
-    public Map<String, List<NumericInterval>> gaps = new HashMap<>();
-    public Set<String> deadNodes = new HashSet<>();
-    public boolean hasDefaultPath;
+public class DecisionPath {
+    public Map<String, Interval> numeric = new HashMap<>();
+    public Map<String, String> categorical = new HashMap<>();
+    public String action;
+    public String label;
+
+    public DecisionPath copy() {
+        DecisionPath p = new DecisionPath();
+        p.numeric.putAll(this.numeric);
+        p.categorical.putAll(this.categorical);
+        return p;
+    }
 }
 
 
@@ -61,151 +72,81 @@ public class GapAnalysisResult {
 
 import java.util.*;
 
-public class FsmlAnalyzer {
+public class PathAnalyzer {
 
-    /* ---------------- Numeric resolution ---------------- */
-
-    static double resolveNumericValue(
-            FsmlModel.Variable var,
-            String value) {
-
-        if (value == null || value.trim().isEmpty()) {
-            return var.min;
-        }
-        if ("LOW".equals(value)) return var.min;
-        if ("HIGH".equals(value)) return var.max;
-        return Double.parseDouble(value);
+    static double resolve(FsmlModel.Variable v, String val) {
+        if (val == null || val.isBlank()) return v.min;
+        if ("LOW".equals(val)) return v.min;
+        if ("HIGH".equals(val)) return v.max;
+        return Double.parseDouble(val);
     }
 
-    /* ---------------- Interval construction ---------------- */
-
-    static List<NumericInterval> buildIntervals(
-            FsmlModel.Variable var,
+    public static List<DecisionPath> extractPaths(
             FsmlModel model) {
 
-        List<NumericInterval> intervals = new ArrayList<>();
-
-        for (FsmlModel.RuleNode node : model.nodes) {
-            List<FsmlModel.Condition> conds = node.conditions.get(var.name);
-            if (conds == null) continue;
-
-            Double low = null;
-            Double high = null;
-
-            for (FsmlModel.Condition c : conds) {
-                double v = resolveNumericValue(var, c.value);
-                if ("ge".equals(c.operator) || "gt".equals(c.operator)) low = v;
-                if ("lt".equals(c.operator) || "le".equals(c.operator)) high = v;
-            }
-
-            if (low != null || high != null) {
-                intervals.add(new NumericInterval(
-                        low != null ? low : var.min,
-                        high != null ? high : var.max,
-                        node.label
-                ));
-            }
-        }
-        return intervals;
+        List<DecisionPath> paths = new ArrayList<>();
+        walk(model.root, new DecisionPath(), model, paths);
+        return paths;
     }
 
-    /* ---------------- GAP + DEAD NODE ANALYSIS ---------------- */
+    private static void walk(
+            FsmlModel.Node node,
+            DecisionPath current,
+            FsmlModel model,
+            List<DecisionPath> out) {
 
-    public static GapAnalysisResult analyze(FsmlModel model) {
+        DecisionPath next = current.copy();
 
-        GapAnalysisResult result = new GapAnalysisResult();
-        Set<String> reachableNodes = new HashSet<>();
+        for (FsmlModel.Condition c : node.conditions) {
+            FsmlModel.Variable v = model.variables.get(c.variable);
 
-        for (FsmlModel.Variable var : model.variables.values()) {
-            if (!"NUMERIC".equals(var.type)) continue;
+            if ("NUMERIC".equals(v.type)) {
+                Interval i = next.numeric.getOrDefault(
+                        v.name,
+                        new Interval(v.min, v.max)
+                );
 
-            List<NumericInterval> intervals = buildIntervals(var, model);
-            intervals.sort(Comparator.comparingDouble(i -> i.start));
+                double val = resolve(v, c.value);
+                Interval local =
+                        ("ge".equals(c.operator) || "gt".equals(c.operator))
+                                ? new Interval(val, v.max)
+                                : new Interval(v.min, val);
 
-            double cursor = var.min;
-            List<NumericInterval> gaps = new ArrayList<>();
+                Interval merged = i.intersect(local);
+                if (merged == null) return; // DEAD PATH
+                next.numeric.put(v.name, merged);
 
-            for (NumericInterval i : intervals) {
-                reachableNodes.add(i.source);
-
-                if (i.start > cursor) {
-                    gaps.add(new NumericInterval(cursor, i.start, "GAP"));
-                }
-                cursor = Math.max(cursor, i.end);
-            }
-
-            if (cursor < var.max) {
-                gaps.add(new NumericInterval(cursor, var.max, "GAP"));
-            }
-
-            if (!gaps.isEmpty()) {
-                result.gaps.put(var.name, gaps);
+            } else {
+                next.categorical.put(v.name, c.value);
             }
         }
 
-        /* ---------------- Dead nodes ---------------- */
-
-        for (FsmlModel.RuleNode node : model.nodes) {
-            if (!reachableNodes.contains(node.label)) {
-                result.deadNodes.add(node.label);
-            }
+        if (node.action != null) {
+            next.action = node.action;
+            next.label = node.label;
+            out.add(next);
+            return;
         }
 
-        /* ---------------- Default / no-hit path ---------------- */
-
-        result.hasDefaultPath = result.gaps.values().stream()
-                .flatMap(List::stream)
-                .anyMatch(g -> (g.end - g.start) > 0);
-
-        return result;
+        for (FsmlModel.Node child : node.children) {
+            walk(child, next, model, out);
+        }
     }
 }
 
 
 
+static List<Interval> gaps(
+        Interval covered,
+        Interval universe) {
 
-
-import java.util.*;
-
-public class CoverageCalculator {
-
-    public static double numericCoverage(
-            FsmlModel.Variable var,
-            List<NumericInterval> intervals,
-            int buckets) {
-
-        double step = (var.max - var.min) / buckets;
-        int covered = 0;
-
-        for (int i = 0; i < buckets; i++) {
-            double probe = var.min + (i * step) + step / 2;
-
-            boolean hit = intervals.stream()
-                    .anyMatch(in -> in.contains(probe));
-
-            if (hit) covered++;
-        }
-        return (covered * 100.0) / buckets;
-    }
-
-    public static double categoricalCoverage(
-            FsmlModel.Variable var,
-            FsmlModel model) {
-
-        Set<String> used = new HashSet<>();
-
-        for (FsmlModel.RuleNode n : model.nodes) {
-            List<FsmlModel.Condition> c = n.conditions.get(var.name);
-            if (c != null) {
-                for (FsmlModel.Condition x : c) {
-                    used.add(x.value);
-                }
-            }
-        }
-        return (used.size() * 100.0) / var.categories.size();
-    }
+    List<Interval> g = new ArrayList<>();
+    if (covered.start > universe.start)
+        g.add(new Interval(universe.start, covered.start));
+    if (covered.end < universe.end)
+        g.add(new Interval(covered.end, universe.end));
+    return g;
 }
-
 
 
 
@@ -216,64 +157,45 @@ import java.util.*;
 public class JUnitTestGenerator {
 
     public static void generate(
-            FsmlModel model,
-            GapAnalysisResult gaps,
-            File file) throws Exception {
+            List<DecisionPath> paths,
+            File outFile) throws Exception {
 
-        try (PrintWriter out = new PrintWriter(file)) {
+        try (PrintWriter out = new PrintWriter(outFile)) {
 
-            out.println("import org.junit.jupiter.api.Test;");
+            out.println("import org.junit.jupiter.api.*;");
             out.println("import static org.junit.jupiter.api.Assertions.*;");
             out.println("import java.util.*;");
-            out.println();
             out.println("class FsmlGeneratedTests {");
 
-            int idx = 1;
+            int i = 1;
 
-            /* -------- Positive tests -------- */
+            // Positive tests
+            for (DecisionPath p : paths) {
+                out.println("@Test void positive_" + i++ + "() {");
+                out.println(" Map<String,Object> in = new HashMap<>();");
 
-            for (FsmlModel.RuleNode node : model.nodes) {
-                if (node.action == null) continue;
+                p.numeric.forEach((k,v) ->
+                        out.println(" in.put(\""+k+"\", "+(v.start+1)+");"));
+                p.categorical.forEach((k,v) ->
+                        out.println(" in.put(\""+k+"\", \""+v+"\");"));
 
-                out.println("  @Test");
-                out.println("  void positive_" + idx++ + "() {");
-                out.println("    Map<String,Object> input = new HashMap<>();");
-
-                for (var e : node.conditions.entrySet()) {
-                    FsmlModel.Variable v = model.variables.get(e.getKey());
-                    FsmlModel.Condition c = e.getValue().get(0);
-
-                    if ("NUMERIC".equals(v.type)) {
-                        double val = FsmlAnalyzer.resolveNumericValue(v, c.value);
-                        out.println("    input.put(\"" + v.name + "\", " + val + ");");
-                    } else {
-                        out.println("    input.put(\"" + v.name + "\", \"" + c.value + "\");");
-                    }
-                }
-
-                out.println("    String result = DecisionEngine.evaluate(input);");
-                out.println("    assertEquals(\"" + node.action + "\", result);");
-                out.println("  }");
+                out.println(" assertEquals(\""+p.action+"\", DecisionEngine.evaluate(in));");
+                out.println("}");
             }
 
-            /* -------- Negative GAP tests -------- */
+            // Negative GAP tests
+            for (DecisionPath p : paths) {
+                for (var e : p.numeric.entrySet()) {
+                    Interval iv = e.getValue();
+                    double probe = iv.start - 1;
 
-            for (var entry : gaps.gaps.entrySet()) {
-                String var = entry.getKey();
-
-                for (NumericInterval g : entry.getValue()) {
-                    double probe = (g.start + g.end) / 2;
-
-                    out.println("  @Test");
-                    out.println("  void negative_gap_" + idx++ + "() {");
-                    out.println("    Map<String,Object> input = new HashMap<>();");
-                    out.println("    input.put(\"" + var + "\", " + probe + ");");
-                    out.println("    String result = DecisionEngine.evaluate(input);");
-                    out.println("    assertNull(result);");
-                    out.println("  }");
+                    out.println("@Test void negative_gap_" + i++ + "() {");
+                    out.println(" Map<String,Object> in = new HashMap<>();");
+                    out.println(" in.put(\""+e.getKey()+"\", "+probe+");");
+                    out.println(" assertNull(DecisionEngine.evaluate(in));");
+                    out.println("}");
                 }
             }
-
             out.println("}");
         }
     }
@@ -281,44 +203,61 @@ public class JUnitTestGenerator {
 
 
 
+import java.io.*;
+import java.util.*;
 
+public class HtmlReportGenerator {
+
+    public static void generate(
+            List<DecisionPath> paths,
+            File file) throws Exception {
+
+        try (PrintWriter out = new PrintWriter(file)) {
+
+            out.println("<html><body>");
+            out.println("<h2>FSML Decision Paths</h2>");
+            out.println("<ul>");
+
+            for (DecisionPath p : paths) {
+                out.println("<li><b>" + p.label + "</b>");
+                out.println("<ul>");
+
+                p.numeric.forEach((k,v) ->
+                        out.println("<li>"+k+": "+v.start+" → "+v.end+"</li>"));
+                p.categorical.forEach((k,v) ->
+                        out.println("<li>"+k+" = "+v+"</li>"));
+
+                out.println("<li><b>ACTION:</b> "+p.action+"</li>");
+                out.println("</ul></li>");
+            }
+
+            out.println("</ul>");
+            out.println("</body></html>");
+        }
+    }
+}
+
+
+
+import java.io.File;
+import java.util.*;
 
 public class Main {
 
     public static void main(String[] args) throws Exception {
 
-        FsmlModel model = FsmlParser.parse(
-                new File("k.fsml"));
+        FsmlModel model =
+                FsmlParser.parse(new File("s.fsml"));
 
-        GapAnalysisResult gaps = FsmlAnalyzer.analyze(model);
+        List<DecisionPath> paths =
+                PathAnalyzer.extractPaths(model);
 
-        System.out.println("=== GAP ANALYSIS ===");
-        gaps.gaps.forEach((k, v) ->
-                v.forEach(g ->
-                        System.out.println(k + " GAP: " + g.start + " → " + g.end)));
-
-        System.out.println("\n=== DEAD NODES ===");
-        gaps.deadNodes.forEach(System.out::println);
-
-        System.out.println("\nDefault / No-Hit Path Exists: " + gaps.hasDefaultPath);
-
-        System.out.println("\n=== COVERAGE ===");
-        for (FsmlModel.Variable v : model.variables.values()) {
-            if ("NUMERIC".equals(v.type)) {
-                double pct = CoverageCalculator.numericCoverage(
-                        v,
-                        FsmlAnalyzer.buildIntervals(v, model),
-                        100);
-                System.out.println(v.name + " coverage: " + pct + "%");
-            } else {
-                double pct = CoverageCalculator.categoricalCoverage(v, model);
-                System.out.println(v.name + " coverage: " + pct + "%");
-            }
-        }
+        System.out.println("Total decision paths: " + paths.size());
 
         JUnitTestGenerator.generate(
-                model,
-                gaps,
-                new File("FsmlGeneratedTests.java"));
+                paths, new File("FsmlGeneratedTests.java"));
+
+        HtmlReportGenerator.generate(
+                paths, new File("fsml-view.html"));
     }
 }
