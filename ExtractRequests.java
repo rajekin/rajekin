@@ -4,8 +4,14 @@ import java.io.*;
 import java.util.*;
 
 /**
- * FSML ANALYZER – SINGLE FILE – JAVA 21
- * Robust against namespaces, flat NODEs, real FICO FSML exports
+ * FULL FSML ANALYZER – SINGLE FILE – JAVA 21
+ * Handles:
+ *  - namespaces
+ *  - nested NODEs
+ *  - flat NODEs (ParentId / TrueNode / FalseNode)
+ *  - multiple roots
+ *  - multiple strategies
+ *  - ACTION / ACTIONS / DECISION
  */
 public class FsmlAnalyzerAllInOne {
 
@@ -27,45 +33,35 @@ public class FsmlAnalyzerAllInOne {
 
     static class FsmlNode {
         String id;
-        String parentId;
         String label;
-        List<Condition> conditions = new ArrayList<>();
-        List<FsmlNode> children = new ArrayList<>();
         String action;
+
+        List<Condition> conditions = new ArrayList<>();
+        List<String> childIds = new ArrayList<>(); // graph edges
     }
 
     static class Model {
         Map<String, Variable> variables = new LinkedHashMap<>();
-        Map<String, FsmlNode> nodesById = new LinkedHashMap<>();
-        FsmlNode root;
+        Map<String, FsmlNode> nodes = new LinkedHashMap<>();
+        Set<String> rootIds = new LinkedHashSet<>();
     }
 
     static class Interval {
-        double start;
-        double end;
-
-        Interval(double s, double e) {
-            this.start = s;
-            this.end = e;
-        }
-
+        double start, end;
+        Interval(double s, double e) { start = s; end = e; }
         Interval intersect(Interval o) {
             double s = Math.max(start, o.start);
             double e = Math.min(end, o.end);
-            if (s >= e) return null;
-            return new Interval(s, e);
+            return (s >= e) ? null : new Interval(s, e);
         }
-
-        public String toString() {
-            return "[" + start + "," + end + ")";
-        }
+        public String toString() { return "[" + start + "," + end + ")"; }
     }
 
     static class DecisionPath {
         Map<String, Interval> numeric = new LinkedHashMap<>();
         Map<String, String> categorical = new LinkedHashMap<>();
         String action;
-        String label;
+        String leafLabel;
 
         DecisionPath copy() {
             DecisionPath p = new DecisionPath();
@@ -86,31 +82,33 @@ public class FsmlAnalyzerAllInOne {
 
         Model model = new Model();
 
-        // ---------- Variables ----------
         NodeList all = doc.getElementsByTagName("*");
-        for (int i = 0; i < all.getLength(); i++) {
-            Node n = all.item(i);
-            if (!(n instanceof Element)) continue;
-            Element e = (Element) n;
 
-            if (e.getLocalName().equalsIgnoreCase("NumericKey")) {
+        /* ---------- VARIABLES ---------- */
+        for (int i = 0; i < all.getLength(); i++) {
+            Element e = asElement(all.item(i));
+            if (e == null) continue;
+
+            String name = e.getLocalName();
+
+            if ("NumericKey".equalsIgnoreCase(name)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.type = "NUMERIC";
-                Element r = (Element) e.getElementsByTagName("*").item(0);
+                Element r = firstChild(e, "NumericRange");
                 v.min = Double.parseDouble(r.getAttribute("minValue"));
                 v.max = Double.parseDouble(r.getAttribute("maxValue"));
                 model.variables.put(v.name, v);
             }
 
-            if (e.getLocalName().equalsIgnoreCase("CategoricalKey")) {
+            if ("CategoricalKey".equalsIgnoreCase(name)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.type = "CATEGORICAL";
                 NodeList cats = e.getElementsByTagName("*");
                 for (int j = 0; j < cats.getLength(); j++) {
-                    Element c = (Element) cats.item(j);
-                    if (c.hasAttribute("Value")) {
+                    Element c = asElement(cats.item(j));
+                    if (c != null && c.hasAttribute("Value")) {
                         v.categories.add(c.getAttribute("Value"));
                     }
                 }
@@ -118,59 +116,67 @@ public class FsmlAnalyzerAllInOne {
             }
         }
 
-        // ---------- Collect ALL NODEs (flat) ----------
+        /* ---------- NODES ---------- */
         for (int i = 0; i < all.getLength(); i++) {
-            Node n = all.item(i);
-            if (!(n instanceof Element)) continue;
-            Element e = (Element) n;
+            Element e = asElement(all.item(i));
+            if (e == null) continue;
+            if (!"NODE".equalsIgnoreCase(e.getLocalName())) continue;
 
-            if (!e.getLocalName().equalsIgnoreCase("NODE")) continue;
+            FsmlNode n = new FsmlNode();
+            n.id = e.getAttribute("Id");
+            n.label = e.getAttribute("Label");
 
-            FsmlNode fn = new FsmlNode();
-            fn.id = e.getAttribute("Id");
-            fn.parentId = e.getAttribute("ParentId");
-            fn.label = e.getAttribute("Label");
-
+            // conditions
             NodeList kids = e.getChildNodes();
             for (int j = 0; j < kids.getLength(); j++) {
-                Node k = kids.item(j);
-                if (!(k instanceof Element)) continue;
-                Element ke = (Element) k;
+                Element k = asElement(kids.item(j));
+                if (k == null) continue;
 
-                if (ke.getLocalName().equalsIgnoreCase("CONDITION")) {
+                String ln = k.getLocalName();
+
+                if ("CONDITION".equalsIgnoreCase(ln)) {
                     Condition c = new Condition();
-                    c.variable = ke.getAttribute("DecisionKey");
-                    c.operator = ke.getAttribute("Type");
-                    c.value = ke.getAttribute("Value");
-                    fn.conditions.add(c);
+                    c.variable = k.getAttribute("DecisionKey");
+                    c.operator = k.getAttribute("Type");
+                    c.value = k.getAttribute("Value");
+                    n.conditions.add(c);
                 }
 
-                if (ke.getLocalName().equalsIgnoreCase("ACTION")
-                        || ke.getLocalName().equalsIgnoreCase("DECISION")) {
-                    fn.action = ke.getAttribute("Label");
+                if ("ACTION".equalsIgnoreCase(ln)
+                        || "DECISION".equalsIgnoreCase(ln)) {
+                    n.action = k.getAttribute("Label");
+                }
+
+                if ("ACTIONS".equalsIgnoreCase(ln)) {
+                    Element a = firstChild(k, "ACTION");
+                    if (a != null) n.action = a.getAttribute("Label");
                 }
             }
-            model.nodesById.put(fn.id, fn);
+
+            // edges (flat FSML)
+            addIfPresent(n.childIds, e.getAttribute("TrueNode"));
+            addIfPresent(n.childIds, e.getAttribute("FalseNode"));
+            addIfPresent(n.childIds, e.getAttribute("NextNode"));
+
+            model.nodes.put(n.id, n);
         }
 
-        // ---------- Build Tree ----------
-        for (FsmlNode n : model.nodesById.values()) {
-            if (n.parentId == null || n.parentId.isBlank()) {
-                model.root = n;
-            } else {
-                FsmlNode parent = model.nodesById.get(n.parentId);
-                if (parent != null) parent.children.add(n);
+        /* ---------- ROOT DETECTION ---------- */
+        Set<String> referenced = new HashSet<>();
+        for (FsmlNode n : model.nodes.values()) {
+            referenced.addAll(n.childIds);
+        }
+
+        for (String id : model.nodes.keySet()) {
+            if (!referenced.contains(id)) {
+                model.rootIds.add(id);
             }
-        }
-
-        if (model.root == null) {
-            throw new RuntimeException("FSML root NODE not found");
         }
 
         return model;
     }
 
-    /* ===================== PATH LOGIC ===================== */
+    /* ===================== PATH EXTRACTION ===================== */
 
     static double resolve(Variable v, String val) {
         if (val == null || val.isBlank()) return v.min;
@@ -180,15 +186,27 @@ public class FsmlAnalyzerAllInOne {
     }
 
     static List<DecisionPath> extractPaths(Model model) {
+
         List<DecisionPath> paths = new ArrayList<>();
-        walk(model.root, new DecisionPath(), model, paths);
+
+        for (String rootId : model.rootIds) {
+            dfs(model.nodes.get(rootId),
+                new DecisionPath(),
+                model,
+                paths,
+                new HashSet<>());
+        }
         return paths;
     }
 
-    static void walk(FsmlNode node,
-                     DecisionPath current,
-                     Model model,
-                     List<DecisionPath> out) {
+    static void dfs(FsmlNode node,
+                    DecisionPath current,
+                    Model model,
+                    List<DecisionPath> out,
+                    Set<String> visited) {
+
+        if (node == null || visited.contains(node.id)) return;
+        visited.add(node.id);
 
         DecisionPath next = current.copy();
 
@@ -197,13 +215,13 @@ public class FsmlAnalyzerAllInOne {
             if (v == null) continue;
 
             if ("NUMERIC".equals(v.type)) {
-                Interval base = next.numeric
-                        .getOrDefault(v.name, new Interval(v.min, v.max));
+                Interval base =
+                        next.numeric.getOrDefault(
+                                v.name, new Interval(v.min, v.max));
 
-                double val = resolve(v, c.value);
                 Interval local = c.operator.startsWith("g")
-                        ? new Interval(val, v.max)
-                        : new Interval(v.min, val);
+                        ? new Interval(resolve(v, c.value), v.max)
+                        : new Interval(v.min, resolve(v, c.value));
 
                 Interval merged = base.intersect(local);
                 if (merged == null) return;
@@ -213,27 +231,37 @@ public class FsmlAnalyzerAllInOne {
             }
         }
 
-        if (node.children.isEmpty()) {
-            next.action = node.action != null ? node.action : "NO_DECISION";
-            next.label = node.label;
+        // leaf = has action OR no outgoing edges
+        if (node.action != null || node.childIds.isEmpty()) {
+            next.action = (node.action != null)
+                    ? node.action
+                    : "DEFAULT / NO HIT";
+            next.leafLabel = node.label;
             out.add(next);
             return;
         }
 
-        for (FsmlNode child : node.children) {
-            walk(child, next, model, out);
+        for (String cid : node.childIds) {
+            dfs(model.nodes.get(cid),
+                next,
+                model,
+                out,
+                new HashSet<>(visited));
         }
     }
 
     /* ===================== OUTPUT ===================== */
 
     static void generateDecisionTable(List<DecisionPath> paths) throws Exception {
+
         try (PrintWriter out = new PrintWriter("decision-table.csv")) {
+
             Set<String> cols = new LinkedHashSet<>();
             for (DecisionPath p : paths) {
                 cols.addAll(p.numeric.keySet());
                 cols.addAll(p.categorical.keySet());
             }
+
             for (String c : cols) out.print(c + ",");
             out.println("ACTION");
 
@@ -243,7 +271,8 @@ public class FsmlAnalyzerAllInOne {
                         out.print(p.numeric.get(c) + ",");
                     else if (p.categorical.containsKey(c))
                         out.print(p.categorical.get(c) + ",");
-                    else out.print("-,");
+                    else
+                        out.print("-,");
                 }
                 out.println(p.action);
             }
@@ -251,10 +280,11 @@ public class FsmlAnalyzerAllInOne {
     }
 
     static void generateHtml(List<DecisionPath> paths) throws Exception {
+
         try (PrintWriter out = new PrintWriter("fsml-view.html")) {
             out.println("<html><body><h2>FSML Decision Paths</h2><ul>");
             for (DecisionPath p : paths) {
-                out.println("<li><b>" + p.label + "</b><ul>");
+                out.println("<li><b>" + p.leafLabel + "</b><ul>");
                 p.numeric.forEach((k,v)->out.println("<li>"+k+" "+v+"</li>"));
                 p.categorical.forEach((k,v)->out.println("<li>"+k+"="+v+"</li>"));
                 out.println("<li><b>ACTION:</b> "+p.action+"</li>");
@@ -264,16 +294,37 @@ public class FsmlAnalyzerAllInOne {
         }
     }
 
+    /* ===================== HELPERS ===================== */
+
+    static Element asElement(Node n) {
+        return (n instanceof Element) ? (Element) n : null;
+    }
+
+    static Element firstChild(Element e, String localName) {
+        NodeList nl = e.getElementsByTagName("*");
+        for (int i = 0; i < nl.getLength(); i++) {
+            Element c = asElement(nl.item(i));
+            if (c != null && localName.equalsIgnoreCase(c.getLocalName())) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    static void addIfPresent(List<String> l, String v) {
+        if (v != null && !v.isBlank()) l.add(v);
+    }
+
     /* ===================== MAIN ===================== */
 
     public static void main(String[] args) throws Exception {
 
-        File fsml = new File("model.fsml"); // <-- your FSML file
+        File fsml = new File("model.fsml"); // <-- update path
         Model model = parseFsml(fsml);
 
         List<DecisionPath> paths = extractPaths(model);
 
-        System.out.println("Total decision paths: " + paths.size());
+        System.out.println("TOTAL DECISION PATHS: " + paths.size());
 
         generateDecisionTable(paths);
         generateHtml(paths);
