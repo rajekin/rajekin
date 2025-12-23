@@ -261,3 +261,37 @@ public class Main {
                 paths, new File("fsml-view.html"));
     }
 }
+
+public class Interval {
+
+    public final double start;   // inclusive
+    public final double end;     // exclusive
+
+    // ✅ REQUIRED constructor
+    public Interval(double start, double end) {
+        if (start >= end) {
+            throw new IllegalArgumentException(
+                "Invalid interval: [" + start + ", " + end + ")"
+            );
+        }
+        this.start = start;
+        this.end = end;
+    }
+
+    // ✅ Intersection (path-aware logic)
+    public Interval intersect(Interval other) {
+        double s = Math.max(this.start, other.start);
+        double e = Math.min(this.end, other.end);
+        return (s < e) ? new Interval(s, e) : null;
+    }
+
+    // ✅ Containment check (coverage, reachability)
+    public boolean contains(double value) {
+        return value >= start && value < end;
+    }
+
+    @Override
+    public String toString() {
+        return "[" + start + ", " + end + ")";
+    }
+}
