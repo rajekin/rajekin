@@ -15,10 +15,10 @@ public class FsmlAnalyzerMain {
 
     static class Interval {
         double min, max;
-        Interval(double min, double max) { this.min = min; this.max = max; }
 
-        boolean covers(Interval o) {
-            return min <= o.min && max >= o.max;
+        Interval(double min, double max) {
+            this.min = min;
+            this.max = max;
         }
 
         Interval intersect(Interval o) {
@@ -27,16 +27,20 @@ public class FsmlAnalyzerMain {
             return lo >= hi ? null : new Interval(lo, hi);
         }
 
+        boolean covers(Interval o) {
+            return min <= o.min && max >= o.max;
+        }
+
         public String toString() {
             return min + " <= x < " + max;
         }
     }
 
     static class Path {
+        int id;
         Map<String, Interval> numeric = new LinkedHashMap<>();
         Map<String, String> categorical = new LinkedHashMap<>();
         String action;
-        int id;
     }
 
     static Map<String, Variable> variables = new LinkedHashMap<>();
@@ -54,6 +58,7 @@ public class FsmlAnalyzerMain {
     static List<Element> children(Element p, String tag) {
         List<Element> out = new ArrayList<>();
         if (p == null) return out;
+
         NodeList nl = p.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
             Node n = nl.item(i);
@@ -79,6 +84,7 @@ public class FsmlAnalyzerMain {
             Element e = (Element) all.item(i);
 
             String tag = local(e);
+
             if ("NumericKey".equalsIgnoreCase(tag)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
@@ -88,6 +94,7 @@ public class FsmlAnalyzerMain {
                 v.max = Double.parseDouble(r.getAttribute("maxValue"));
                 variables.put(v.name, v);
             }
+
             if ("CategoricalKey".equalsIgnoreCase(tag)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
@@ -100,6 +107,7 @@ public class FsmlAnalyzerMain {
     /* ===================== CONDITION EXTRACTION ===================== */
 
     static void extractConditions(Element cond, Path p) {
+
         List<Element> nested = children(cond, "CONDITION");
         if (!nested.isEmpty()) {
             for (Element c : nested) extractConditions(c, p);
@@ -108,7 +116,7 @@ public class FsmlAnalyzerMain {
 
         String key = cond.getAttribute("DecisionKey");
         String type = cond.getAttribute("Type");
-        String val = cond.getAttribute("Value");
+        String val  = cond.getAttribute("Value");
 
         if (key.isEmpty() || type.isEmpty()) return;
         if ("true".equalsIgnoreCase(type) || "and".equalsIgnoreCase(type)) return;
@@ -140,15 +148,18 @@ public class FsmlAnalyzerMain {
         }
     }
 
-    /* ===================== WALK ===================== */
+    /* ===================== TREE WALK ===================== */
 
     static void walk(Element node, Path incoming) {
+        if (node == null) return;
+
         Path cur = new Path();
         cur.numeric.putAll(incoming.numeric);
         cur.categorical.putAll(incoming.categorical);
 
-        for (Element c : children(node, "CONDITION"))
+        for (Element c : children(node, "CONDITION")) {
             extractConditions(c, cur);
+        }
 
         Element act = firstChild(node, "ACTIONS");
         List<Element> kids = children(node, "NODE");
@@ -165,7 +176,7 @@ public class FsmlAnalyzerMain {
 
     /* ===================== GAP ANALYSIS ===================== */
 
-    static void gapAnalysis() throws Exception {
+    static void writeGapAnalysis() throws Exception {
         PrintWriter out = new PrintWriter("gap-analysis.txt");
 
         for (Variable v : variables.values()) {
@@ -175,65 +186,110 @@ public class FsmlAnalyzerMain {
 
             for (Path p : paths) {
                 Interval i = p.numeric.get(v.name);
-                covered.add(i == null ? new Interval(v.min, v.max) : i);
+                covered.add(i == null
+                        ? new Interval(v.min, v.max)
+                        : i);
             }
 
             covered.sort(Comparator.comparingDouble(a -> a.min));
 
             double cursor = v.min;
-            boolean gap = false;
+            boolean gapFound = false;
 
             for (Interval c : covered) {
                 if (c.min > cursor) {
                     out.println("GAP " + v.name + ": " + cursor + " → " + c.min);
-                    gap = true;
+                    gapFound = true;
                 }
                 cursor = Math.max(cursor, c.max);
             }
 
             if (cursor < v.max) {
                 out.println("GAP " + v.name + ": " + cursor + " → " + v.max);
-                gap = true;
+                gapFound = true;
             }
 
-            if (!gap) out.println("NO GAPS " + v.name);
+            if (!gapFound) {
+                out.println("NO GAPS " + v.name);
+            }
             out.println();
         }
+
         out.close();
     }
 
     /* ===================== SHADOWED PATHS ===================== */
 
-    static void detectShadowedPaths() throws Exception {
+    static String describePath(Path p) {
+        StringBuilder sb = new StringBuilder();
+
+        if (!p.numeric.isEmpty()) {
+            sb.append("Numeric Conditions:\n");
+            for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
+                sb.append("  - ").append(e.getKey())
+                  .append(" ").append(e.getValue()).append("\n");
+            }
+        }
+
+        if (!p.categorical.isEmpty()) {
+            sb.append("Categorical Conditions:\n");
+            for (Map.Entry<String, String> e : p.categorical.entrySet()) {
+                sb.append("  - ").append(e.getKey())
+                  .append(" = ").append(e.getValue()).append("\n");
+            }
+        }
+
+        sb.append("Action:\n");
+        sb.append("  - ").append(p.action).append("\n");
+        return sb.toString();
+    }
+
+    static void writeShadowedPaths() throws Exception {
         PrintWriter out = new PrintWriter("shadowed-paths.txt");
+        boolean found = false;
 
         for (Path a : paths) {
             for (Path b : paths) {
                 if (a == b) continue;
-                if (!a.action.equals(b.action)) continue;
+                if (!Objects.equals(a.action, b.action)) continue;
 
-                boolean shadowed = true;
+                boolean shadows = true;
 
                 for (Map.Entry<String, Interval> e : a.numeric.entrySet()) {
                     Interval bi = b.numeric.get(e.getKey());
-                    if (bi == null || !bi.covers(e.getValue())) {
-                        shadowed = false;
+                    if (bi == null || !e.getValue().covers(bi)) {
+                        shadows = false;
                         break;
                     }
                 }
 
                 for (Map.Entry<String, String> e : a.categorical.entrySet()) {
                     if (!e.getValue().equals(b.categorical.get(e.getKey()))) {
-                        shadowed = false;
+                        shadows = false;
                         break;
                     }
                 }
 
-                if (shadowed) {
-                    out.println("Path " + b.id + " is shadowed by Path " + a.id);
+                if (shadows) {
+                    found = true;
+                    out.println("==================================================");
+                    out.println("SHADOWED PATH DETECTED");
+                    out.println();
+                    out.println("Shadowing Path (ID " + a.id + "):");
+                    out.print(describePath(a));
+                    out.println();
+                    out.println("Shadowed Path (ID " + b.id + "):");
+                    out.print(describePath(b));
+                    out.println("==================================================");
+                    out.println();
                 }
             }
         }
+
+        if (!found) {
+            out.println("No shadowed paths detected.");
+        }
+
         out.close();
     }
 
@@ -243,7 +299,7 @@ public class FsmlAnalyzerMain {
 
         Document doc = DocumentBuilderFactory.newInstance()
                 .newDocumentBuilder()
-                .parse(new File("PenFed_AR_Expert_09042025.fsml"));
+                .parse(new File("PenFed_AR_Expert_09042025.fsml")); // <-- update if needed
 
         parseVariables(doc);
 
@@ -261,8 +317,8 @@ public class FsmlAnalyzerMain {
 
         walk(firstChild(strategy, "NODE"), new Path());
 
-        gapAnalysis();
-        detectShadowedPaths();
+        writeGapAnalysis();
+        writeShadowedPaths();
 
         System.out.println("TOTAL PATHS = " + paths.size());
         System.out.println("Generated:");
