@@ -15,7 +15,10 @@ public class FsmlAnalyzerMain {
 
     static class Interval {
         double min, max;
-        Interval(double min, double max) { this.min = min; this.max = max; }
+        Interval(double min, double max) {
+            this.min = min;
+            this.max = max;
+        }
         Interval intersect(Interval o) {
             double lo = Math.max(min, o.min);
             double hi = Math.min(max, o.max);
@@ -47,19 +50,18 @@ public class FsmlAnalyzerMain {
 
     /* ===================== XML HELPERS ===================== */
 
-    // Handles namespaces safely
     static String local(Node n) {
         if (n.getLocalName() != null) return n.getLocalName();
         String name = n.getNodeName();
-        int idx = name.indexOf(':');
-        return idx >= 0 ? name.substring(idx + 1) : name;
+        int i = name.indexOf(':');
+        return i >= 0 ? name.substring(i + 1) : name;
     }
 
-    static List<Element> children(Element parent, String tag) {
+    static List<Element> children(Element p, String tag) {
         List<Element> list = new ArrayList<>();
-        if (parent == null) return list;
+        if (p == null) return list;
 
-        NodeList nl = parent.getChildNodes();
+        NodeList nl = p.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
             Node n = nl.item(i);
             if (n instanceof Element) {
@@ -72,8 +74,8 @@ public class FsmlAnalyzerMain {
         return list;
     }
 
-    static Element firstChild(Element parent, String tag) {
-        List<Element> list = children(parent, tag);
+    static Element firstChild(Element p, String tag) {
+        List<Element> list = children(p, tag);
         return list.isEmpty() ? null : list.get(0);
     }
 
@@ -84,11 +86,11 @@ public class FsmlAnalyzerMain {
         for (int i = 0; i < all.getLength(); i++) {
             Node n = all.item(i);
             if (!(n instanceof Element)) continue;
+
             Element e = (Element) n;
+            String tag = local(e);
 
-            String name = local(e);
-
-            if ("NumericKey".equalsIgnoreCase(name)) {
+            if ("NumericKey".equalsIgnoreCase(tag)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.numeric = true;
@@ -100,7 +102,7 @@ public class FsmlAnalyzerMain {
                 variables.put(v.name, v);
             }
 
-            if ("CategoricalKey".equalsIgnoreCase(name)) {
+            if ("CategoricalKey".equalsIgnoreCase(tag)) {
                 Variable v = new Variable();
                 v.name = e.getAttribute("ShortName");
                 v.numeric = false;
@@ -166,53 +168,62 @@ public class FsmlAnalyzerMain {
         }
     }
 
-    /* ===================== OUTPUT ===================== */
+    /* ===================== PATH-BASED DECISION TABLE ===================== */
 
     static void writeDecisionTable() throws Exception {
         PrintWriter out = new PrintWriter("decision-table.csv");
-        out.print("RULE,");
-        for (String v : variables.keySet()) out.print(v + ",");
-        out.println("ACTION");
+        out.println("RULE,CONDITIONS,ACTION");
 
         int r = 1;
         for (Path p : paths) {
-            out.print("R" + r++ + ",");
-            for (Variable v : variables.values()) {
-                if (v.numeric) {
-                    Interval i = p.numeric.get(v.name);
-                    out.print((i == null ? "ANY" : i) + ",");
-                } else {
-                    String c = p.categorical.get(v.name);
-                    out.print((c == null ? "ANY" : c) + ",");
-                }
+            StringBuilder cond = new StringBuilder();
+
+            for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
+                cond.append(e.getKey())
+                    .append(" ")
+                    .append(e.getValue())
+                    .append(" ; ");
             }
-            out.println(p.action);
+
+            for (Map.Entry<String, String> e : p.categorical.entrySet()) {
+                cond.append(e.getKey())
+                    .append(" = ")
+                    .append(e.getValue())
+                    .append(" ; ");
+            }
+
+            out.println("R" + r++ + ",\"" +
+                    cond.toString().trim() + "\"," +
+                    p.action);
         }
         out.close();
     }
 
+    /* ===================== HTML (MATCHES YOUR SCREENSHOT) ===================== */
+
     static void writeHtml() throws Exception {
         PrintWriter out = new PrintWriter("fsml-view.html");
-        out.println("<html><body><h2>Decision Table</h2><table border='1'>");
-        out.print("<tr>");
-        for (String v : variables.keySet()) out.print("<th>" + v + "</th>");
-        out.println("<th>ACTION</th></tr>");
+        out.println("<html><body>");
+        out.println("<h2>FSML Decision Paths</h2>");
 
+        int r = 1;
         for (Path p : paths) {
-            out.print("<tr>");
-            for (Variable v : variables.values()) {
-                if (v.numeric) {
-                    Interval i = p.numeric.get(v.name);
-                    out.print("<td>" + (i == null ? "ANY" : i) + "</td>");
-                } else {
-                    String c = p.categorical.get(v.name);
-                    out.print("<td>" + (c == null ? "ANY" : c) + "</td>");
-                }
+            out.println("<div style='margin-bottom:16px'>");
+            out.println("<b>Rule " + (r++) + "</b>");
+            out.println("<ul>");
+
+            for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
+                out.println("<li>" + e.getKey() + " " + e.getValue() + "</li>");
             }
-            out.print("<td><b>" + p.action + "</b></td>");
-            out.println("</tr>");
+            for (Map.Entry<String, String> e : p.categorical.entrySet()) {
+                out.println("<li>" + e.getKey() + " = " + e.getValue() + "</li>");
+            }
+
+            out.println("<li><b>ACTION:</b> " + p.action + "</li>");
+            out.println("</ul></div>");
         }
-        out.println("</table></body></html>");
+
+        out.println("</body></html>");
         out.close();
     }
 
@@ -220,8 +231,7 @@ public class FsmlAnalyzerMain {
 
     public static void main(String[] args) throws Exception {
 
-        Document doc = DocumentBuilderFactory
-                .newInstance()
+        Document doc = DocumentBuilderFactory.newInstance()
                 .newDocumentBuilder()
                 .parse(new File("PenFed_AR_Expert_09042025.fsml"));
 
@@ -240,14 +250,12 @@ public class FsmlAnalyzerMain {
             }
         }
 
-        if (strategy == null) {
-            throw new RuntimeException("No STRATEGY element found in FSML");
-        }
+        if (strategy == null)
+            throw new RuntimeException("No STRATEGY element found");
 
         Element root = firstChild(strategy, "NODE");
-        if (root == null) {
-            throw new RuntimeException("No root NODE found under STRATEGY");
-        }
+        if (root == null)
+            throw new RuntimeException("No root NODE under STRATEGY");
 
         walk(root, new Path());
 
@@ -255,5 +263,8 @@ public class FsmlAnalyzerMain {
         writeHtml();
 
         System.out.println("TOTAL PATHS = " + paths.size());
+        System.out.println("Generated:");
+        System.out.println(" decision-table.csv");
+        System.out.println(" fsml-view.html");
     }
 }
