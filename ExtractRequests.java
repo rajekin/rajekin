@@ -1,55 +1,44 @@
-static void writeVisualHtml() throws Exception {
-    PrintWriter out = new PrintWriter("fsml-visual.html");
+Hi [Boss’s Name],
 
-    out.println("<html><head><style>");
-    out.println("body { font-family: Arial; background:#f4f6f8; margin:20px; }");
-    out.println(".rule { background:white; border-radius:8px; padding:14px; margin-bottom:16px;");
-    out.println("        box-shadow:0 2px 6px rgba(0,0,0,0.15); max-width:900px; }");
-    out.println(".title { font-weight:bold; margin-bottom:8px; color:#2c3e50; }");
-    out.println(".cond { margin-left:20px; margin-bottom:4px; }");
-    out.println(".num { color:#2980b9; }");
-    out.println(".cat { color:#27ae60; }");
-    out.println(".action { margin-top:10px; font-weight:bold; color:#c0392b; }");
-    out.println(".arrow { color:#7f8c8d; margin-right:6px; }");
-    out.println("</style></head><body>");
+I wanted to share an update on the FSML analysis work.
 
-    out.println("<h1>FSML Decision Paths</h1>");
-    out.println("<p>Vertical, path-based view (conditions shown in evaluation order)</p>");
+I was able to successfully analyze the FSML and fully traverse the decision logic. From this, I extracted all decision paths (rules) and generated the following artifacts:
 
-    int r = 1;
-    for (Path p : paths) {
-        out.println("<div class='rule'>");
-        out.println("<div class='title'>Rule " + (r++) + "</div>");
+* **HTML visualization** of the FSML decision logic
 
-        // Numeric conditions
-        for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
-            Interval i = e.getValue();
+  * Presents each rule as a clear, path-based view (conditions → action)
+  * Easy to review and share with non-technical stakeholders
+* **Excel/CSV rule extract**
 
-            // Skip full-domain noise
-            Variable v = variables.get(e.getKey());
-            if (v != null && i.min == v.min && i.max == v.max) continue;
+  * One row per decision path with explicit conditions and outcomes
+  * Suitable for validation, review, and audit purposes
 
-            out.println("<div class='cond num'>");
-            out.println("<span class='arrow'>➜</span>");
-            out.println(esc(e.getKey()) + " " + esc(i.toString()));
-            out.println("</div>");
-        }
+In addition, I performed **model analysis** on the extracted rules:
 
-        // Categorical conditions
-        for (Map.Entry<String, String> e : p.categorical.entrySet()) {
-            out.println("<div class='cond cat'>");
-            out.println("<span class='arrow'>➜</span>");
-            out.println(esc(e.getKey()) + " = " + esc(e.getValue()));
-            out.println("</div>");
-        }
+### Shadowed Paths
 
-        out.println("<div class='action'>");
-        out.println("✔ ACTION → " + esc(p.action));
-        out.println("</div>");
+During the analysis, I identified *shadowed paths*. A shadowed path is a rule that can never independently influence a decision because:
 
-        out.println("</div>");
-    }
+* Another rule with the **same outcome** already covers all of its conditions, and
+* The shadowed rule is more specific but does not change the final action
 
-    out.println("</body></html>");
-    out.close();
-}
+In practice, this means the shadowed rule is **redundant** and will never fire differently than the broader rule above it. These are not functional defects, but they are important from a:
+
+* **Maintainability** perspective (unnecessary complexity)
+* **Testing/QA** perspective (extra test cases with no behavioral impact)
+* **Governance and audit** perspective (dead or redundant logic is often flagged)
+
+I’ve included the full conditions and actions for both the shadowing and shadowed paths so they can be reviewed and discussed.
+
+### Gap Analysis
+
+I also ran a gap analysis across the numeric decision variables to confirm coverage. The results indicate that the model logic covers the full expected input ranges, with no uncovered gaps in decisioning.
+
+Please let me know if you’d like me to:
+
+* Walk through the HTML visualization together
+* Summarize key findings or recommendations
+* Provide a trimmed version of the rules excluding shadowed paths
+
+Thanks,
+Raj
