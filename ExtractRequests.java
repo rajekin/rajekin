@@ -32,7 +32,7 @@ public class FsmlAnalyzerMain {
         }
 
         public String toString() {
-            return min + " <= x < " + max;
+            return min + " ≤ x < " + max;
         }
     }
 
@@ -58,7 +58,6 @@ public class FsmlAnalyzerMain {
     static List<Element> children(Element p, String tag) {
         List<Element> out = new ArrayList<>();
         if (p == null) return out;
-
         NodeList nl = p.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
             Node n = nl.item(i);
@@ -75,6 +74,11 @@ public class FsmlAnalyzerMain {
         return c.isEmpty() ? null : c.get(0);
     }
 
+    static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+    }
+
     /* ===================== VARIABLE PARSING ===================== */
 
     static void parseVariables(Document doc) {
@@ -82,7 +86,6 @@ public class FsmlAnalyzerMain {
         for (int i = 0; i < all.getLength(); i++) {
             if (!(all.item(i) instanceof Element)) continue;
             Element e = (Element) all.item(i);
-
             String tag = local(e);
 
             if ("NumericKey".equalsIgnoreCase(tag)) {
@@ -107,7 +110,6 @@ public class FsmlAnalyzerMain {
     /* ===================== CONDITION EXTRACTION ===================== */
 
     static void extractConditions(Element cond, Path p) {
-
         List<Element> nested = children(cond, "CONDITION");
         if (!nested.isEmpty()) {
             for (Element c : nested) extractConditions(c, p);
@@ -183,35 +185,30 @@ public class FsmlAnalyzerMain {
             if (!v.numeric) continue;
 
             List<Interval> covered = new ArrayList<>();
-
             for (Path p : paths) {
                 Interval i = p.numeric.get(v.name);
-                covered.add(i == null
-                        ? new Interval(v.min, v.max)
-                        : i);
+                covered.add(i == null ? new Interval(v.min, v.max) : i);
             }
 
             covered.sort(Comparator.comparingDouble(a -> a.min));
 
             double cursor = v.min;
-            boolean gapFound = false;
+            boolean gap = false;
 
             for (Interval c : covered) {
                 if (c.min > cursor) {
                     out.println("GAP " + v.name + ": " + cursor + " → " + c.min);
-                    gapFound = true;
+                    gap = true;
                 }
                 cursor = Math.max(cursor, c.max);
             }
 
             if (cursor < v.max) {
                 out.println("GAP " + v.name + ": " + cursor + " → " + v.max);
-                gapFound = true;
+                gap = true;
             }
 
-            if (!gapFound) {
-                out.println("NO GAPS " + v.name);
-            }
+            if (!gap) out.println("NO GAPS " + v.name);
             out.println();
         }
 
@@ -220,34 +217,23 @@ public class FsmlAnalyzerMain {
 
     /* ===================== SHADOWED PATHS ===================== */
 
-    static String describePath(Path p) {
+    static String describe(Path p) {
         StringBuilder sb = new StringBuilder();
 
-        if (!p.numeric.isEmpty()) {
-            sb.append("Numeric Conditions:\n");
-            for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
-                sb.append("  - ").append(e.getKey())
-                  .append(" ").append(e.getValue()).append("\n");
-            }
-        }
+        for (Map.Entry<String, Interval> e : p.numeric.entrySet())
+            sb.append("  ").append(e.getKey()).append(" ").append(e.getValue()).append("\n");
 
-        if (!p.categorical.isEmpty()) {
-            sb.append("Categorical Conditions:\n");
-            for (Map.Entry<String, String> e : p.categorical.entrySet()) {
-                sb.append("  - ").append(e.getKey())
-                  .append(" = ").append(e.getValue()).append("\n");
-            }
-        }
+        for (Map.Entry<String, String> e : p.categorical.entrySet())
+            sb.append("  ").append(e.getKey()).append(" = ").append(e.getValue()).append("\n");
 
-        sb.append("Action:\n");
-        sb.append("  - ").append(p.action).append("\n");
+        sb.append("  ACTION = ").append(p.action).append("\n");
         return sb.toString();
     }
 
     static void writeShadowedPaths() throws Exception {
         PrintWriter out = new PrintWriter("shadowed-paths.txt");
-        boolean found = false;
 
+        boolean found = false;
         for (Path a : paths) {
             for (Path b : paths) {
                 if (a == b) continue;
@@ -272,24 +258,71 @@ public class FsmlAnalyzerMain {
 
                 if (shadows) {
                     found = true;
-                    out.println("==================================================");
-                    out.println("SHADOWED PATH DETECTED");
-                    out.println();
-                    out.println("Shadowing Path (ID " + a.id + "):");
-                    out.print(describePath(a));
-                    out.println();
-                    out.println("Shadowed Path (ID " + b.id + "):");
-                    out.print(describePath(b));
-                    out.println("==================================================");
-                    out.println();
+                    out.println("============================================");
+                    out.println("Shadowing Path " + a.id);
+                    out.print(describe(a));
+                    out.println("Shadowed Path " + b.id);
+                    out.print(describe(b));
                 }
             }
         }
 
-        if (!found) {
-            out.println("No shadowed paths detected.");
+        if (!found) out.println("No shadowed paths detected.");
+        out.close();
+    }
+
+    /* ===================== BEAUTIFUL VISUAL HTML ===================== */
+
+    static void writeVisualHtml() throws Exception {
+        PrintWriter out = new PrintWriter("fsml-visual.html");
+
+        out.println("""
+        <html>
+        <head>
+        <style>
+        body { font-family: Arial; background:#f4f6f8; margin:20px; }
+        .card { background:white; border-radius:8px; padding:12px; margin-bottom:14px;
+                box-shadow:0 2px 6px rgba(0,0,0,0.15); }
+        .num { color:#2980b9; margin-left:12px; }
+        .cat { color:#27ae60; margin-left:12px; }
+        .action { color:#c0392b; font-weight:bold; margin-top:6px; }
+        svg { background:white; border:1px solid #ccc; margin-bottom:30px; }
+        </style>
+        </head><body>
+        <h1>FSML Decision Paths – Visual</h1>
+        """);
+
+        int y = 40;
+        out.println("<svg width='1400' height='" + (paths.size()*80+100) + "'>");
+        for (Path p : paths) {
+            int x = 40;
+            out.println("<circle cx='"+x+"' cy='"+y+"' r='5' fill='#34495e'/>");
+
+            for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
+                x += 180;
+                out.println("<line x1='"+(x-180)+"' y1='"+y+"' x2='"+x+"' y2='"+y+"' stroke='#555'/>");
+                out.println("<rect x='"+(x-70)+"' y='"+(y-18)+"' width='140' height='36' rx='6' fill='#ecf0f1'/>");
+                out.println("<text x='"+x+"' y='"+(y+5)+"' text-anchor='middle'>"+esc(e.getKey()+" "+e.getValue())+"</text>");
+            }
+
+            x += 200;
+            out.println("<rect x='"+(x-80)+"' y='"+(y-20)+"' width='160' height='40' rx='8' fill='#f9e79f'/>");
+            out.println("<text x='"+x+"' y='"+(y+6)+"' text-anchor='middle'>"+esc(p.action)+"</text>");
+            y += 80;
+        }
+        out.println("</svg>");
+
+        int r = 1;
+        for (Path p : paths) {
+            out.println("<div class='card'><b>Rule "+(r++)+"</b>");
+            for (Map.Entry<String, Interval> e : p.numeric.entrySet())
+                out.println("<div class='num'>"+esc(e.getKey()+" "+e.getValue())+"</div>");
+            for (Map.Entry<String, String> e : p.categorical.entrySet())
+                out.println("<div class='cat'>"+esc(e.getKey()+" = "+e.getValue())+"</div>");
+            out.println("<div class='action'>ACTION → "+esc(p.action)+"</div></div>");
         }
 
+        out.println("</body></html>");
         out.close();
     }
 
@@ -299,7 +332,7 @@ public class FsmlAnalyzerMain {
 
         Document doc = DocumentBuilderFactory.newInstance()
                 .newDocumentBuilder()
-                .parse(new File("PenFed_AR_Expert_09042025.fsml")); // <-- update if needed
+                .parse(new File("PenFed_AR_Expert_09042025.fsml")); // change if needed
 
         parseVariables(doc);
 
@@ -319,10 +352,12 @@ public class FsmlAnalyzerMain {
 
         writeGapAnalysis();
         writeShadowedPaths();
+        writeVisualHtml();
 
         System.out.println("TOTAL PATHS = " + paths.size());
         System.out.println("Generated:");
         System.out.println(" gap-analysis.txt");
         System.out.println(" shadowed-paths.txt");
+        System.out.println(" fsml-visual.html");
     }
 }
