@@ -23,6 +23,144 @@ public class FsmlModel {
         public String action;
     }
 
+
+    import org.w3c.dom.*;
+import javax.xml.parsers.*;
+import java.io.File;
+import java.util.*;
+
+public class FsmlParser {
+
+    public static FsmlModel parse(File fsmlFile) throws Exception {
+
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        dbf.setNamespaceAware(false);
+        dbf.setIgnoringComments(true);
+        dbf.setIgnoringElementContentWhitespace(true);
+
+        DocumentBuilder builder = dbf.newDocumentBuilder();
+        Document doc = builder.parse(fsmlFile);
+        doc.getDocumentElement().normalize();
+
+        FsmlModel model = new FsmlModel();
+
+        parseDecisionArea(doc, model);
+        parseStrategy(doc, model);
+
+        return model;
+    }
+
+    /* ---------------- Decision Area ---------------- */
+
+    private static void parseDecisionArea(Document doc, FsmlModel model) {
+
+        NodeList numericKeys = doc.getElementsByTagName("NumericKey");
+        for (int i = 0; i < numericKeys.getLength(); i++) {
+            Element e = (Element) numericKeys.item(i);
+
+            FsmlModel.Variable v = new FsmlModel.Variable();
+            v.name = e.getAttribute("ShortName");
+            v.type = "NUMERIC";
+
+            Element range =
+                    (Element) e.getElementsByTagName("NumericRange").item(0);
+
+            v.min = Double.parseDouble(range.getAttribute("minValue"));
+            v.max = Double.parseDouble(range.getAttribute("maxValue"));
+
+            model.variables.put(v.name, v);
+        }
+
+        NodeList catKeys = doc.getElementsByTagName("CategoricalKey");
+        for (int i = 0; i < catKeys.getLength(); i++) {
+            Element e = (Element) catKeys.item(i);
+
+            FsmlModel.Variable v = new FsmlModel.Variable();
+            v.name = e.getAttribute("ShortName");
+            v.type = "CATEGORICAL";
+
+            NodeList cats = e.getElementsByTagName("CATEGORY");
+            for (int j = 0; j < cats.getLength(); j++) {
+                v.categories.add(
+                        ((Element) cats.item(j)).getAttribute("Value"));
+            }
+
+            model.variables.put(v.name, v);
+        }
+    }
+
+    /* ---------------- Strategy & Tree ---------------- */
+
+    private static void parseStrategy(Document doc, FsmlModel model) {
+
+        Element strategy =
+                (Element) doc.getElementsByTagName("STRATEGY").item(0);
+
+        // Find top-level NODE (root)
+        NodeList children = strategy.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node n = children.item(i);
+
+            if (n instanceof Element
+                    && "NODE".equals(n.getNodeName())) {
+
+                model.root = parseNode((Element) n);
+                return;
+            }
+        }
+    }
+
+    /* ---------------- Recursive NODE parsing ---------------- */
+
+    private static FsmlModel.Node parseNode(Element nodeEl) {
+
+        FsmlModel.Node node = new FsmlModel.Node();
+        node.label = nodeEl.getAttribute("Label");
+
+        // Conditions
+        NodeList conds = nodeEl.getElementsByTagName("CONDITION");
+        for (int i = 0; i < conds.getLength(); i++) {
+
+            Element c = (Element) conds.item(i);
+
+            // IMPORTANT: only direct conditions
+            if (c.getParentNode() != nodeEl) continue;
+
+            FsmlModel.Condition cond = new FsmlModel.Condition();
+            cond.variable = c.getAttribute("DecisionKey");
+            cond.operator = c.getAttribute("Type");
+            cond.value = c.getAttribute("Value");
+
+            node.conditions.add(cond);
+        }
+
+        // Action (leaf)
+        NodeList actions = nodeEl.getElementsByTagName("ACTIONS");
+        for (int i = 0; i < actions.getLength(); i++) {
+            Element a = (Element) actions.item(i);
+            if (a.getParentNode() == nodeEl) {
+                node.action = a.getAttribute("Label");
+                break;
+            }
+        }
+
+        // Child nodes
+        NodeList kids = nodeEl.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+
+            if (n instanceof Element
+                    && "NODE".equals(n.getNodeName())) {
+
+                node.children.add(parseNode((Element) n));
+            }
+        }
+
+        return node;
+    }
+}
+
+
     public Map<String, Variable> variables = new HashMap<>();
     public Node root;
 }
@@ -295,3 +433,4 @@ public class Interval {
         return "[" + start + ", " + end + ")";
     }
 }
+
