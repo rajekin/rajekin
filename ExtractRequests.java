@@ -1,259 +1,227 @@
-import java.util.*;
-
-public class FsmlModel {
-
-    public static class Variable {
-        public String name;
-        public String type; // NUMERIC / CATEGORICAL
-        public double min;
-        public double max;
-        public Set<String> categories = new HashSet<>();
-    }
-
-    public static class Condition {
-        public String variable;
-        public String operator; // ge, gt, lt, le, eq
-        public String value;
-    }
-
-    public static class Node {
-        public String label;
-        public List<Condition> conditions = new ArrayList<>();
-        public List<Node> children = new ArrayList<>();
-        public String action;
-    }
-
-
-    import org.w3c.dom.*;
+import org.w3c.dom.*;
 import javax.xml.parsers.*;
-import java.io.File;
+import java.io.*;
 import java.util.*;
 
-public class FsmlParser {
+/**
+ * ALL-IN-ONE FSML ANALYZER
+ * Java 21 safe
+ */
+public class FsmlAnalyzerAllInOne {
 
-    public static FsmlModel parse(File fsmlFile) throws Exception {
+    /* =========================================================
+       MODEL
+       ========================================================= */
+
+    static class Variable {
+        String name;
+        String type; // NUMERIC / CATEGORICAL
+        double min;
+        double max;
+        Set<String> categories = new HashSet<>();
+    }
+
+    static class Condition {
+        String variable;
+        String operator; // ge, gt, lt, le, eq
+        String value;
+    }
+
+    static class Node {
+        String label;
+        List<Condition> conditions = new ArrayList<>();
+        List<Node> children = new ArrayList<>();
+        String action;
+    }
+
+    static class Model {
+        Map<String, Variable> variables = new HashMap<>();
+        Node root;
+    }
+
+    /* =========================================================
+       INTERVAL (REQUIRED FIX)
+       ========================================================= */
+
+    static class Interval {
+        final double start; // inclusive
+        final double end;   // exclusive
+
+        Interval(double s, double e) {
+            if (s >= e) {
+                throw new IllegalArgumentException(
+                        "Invalid interval [" + s + "," + e + ")");
+            }
+            this.start = s;
+            this.end = e;
+        }
+
+        Interval intersect(Interval other) {
+            double s = Math.max(start, other.start);
+            double e = Math.min(end, other.end);
+            return (s < e) ? new Interval(s, e) : null;
+        }
+
+        boolean contains(double v) {
+            return v >= start && v < end;
+        }
+
+        public String toString() {
+            return "[" + start + "," + end + ")";
+        }
+    }
+
+    /* =========================================================
+       DECISION PATH
+       ========================================================= */
+
+    static class DecisionPath {
+        Map<String, Interval> numeric = new LinkedHashMap<>();
+        Map<String, String> categorical = new LinkedHashMap<>();
+        String action;
+        String label;
+
+        DecisionPath copy() {
+            DecisionPath p = new DecisionPath();
+            p.numeric.putAll(this.numeric);
+            p.categorical.putAll(this.categorical);
+            return p;
+        }
+    }
+
+    /* =========================================================
+       FSML PARSER (TREE-AWARE)
+       ========================================================= */
+
+    static Model parseFsml(File file) throws Exception {
 
         DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setNamespaceAware(false);
         dbf.setIgnoringComments(true);
-        dbf.setIgnoringElementContentWhitespace(true);
+        dbf.setNamespaceAware(false);
 
-        DocumentBuilder builder = dbf.newDocumentBuilder();
-        Document doc = builder.parse(fsmlFile);
+        Document doc = dbf.newDocumentBuilder().parse(file);
         doc.getDocumentElement().normalize();
 
-        FsmlModel model = new FsmlModel();
+        Model model = new Model();
 
-        parseDecisionArea(doc, model);
-        parseStrategy(doc, model);
-
-        return model;
-    }
-
-    /* ---------------- Decision Area ---------------- */
-
-    private static void parseDecisionArea(Document doc, FsmlModel model) {
-
+        // ---- DecisionArea ----
         NodeList numericKeys = doc.getElementsByTagName("NumericKey");
         for (int i = 0; i < numericKeys.getLength(); i++) {
             Element e = (Element) numericKeys.item(i);
-
-            FsmlModel.Variable v = new FsmlModel.Variable();
+            Variable v = new Variable();
             v.name = e.getAttribute("ShortName");
             v.type = "NUMERIC";
-
-            Element range =
-                    (Element) e.getElementsByTagName("NumericRange").item(0);
-
-            v.min = Double.parseDouble(range.getAttribute("minValue"));
-            v.max = Double.parseDouble(range.getAttribute("maxValue"));
-
+            Element r = (Element) e.getElementsByTagName("NumericRange").item(0);
+            v.min = Double.parseDouble(r.getAttribute("minValue"));
+            v.max = Double.parseDouble(r.getAttribute("maxValue"));
             model.variables.put(v.name, v);
         }
 
         NodeList catKeys = doc.getElementsByTagName("CategoricalKey");
         for (int i = 0; i < catKeys.getLength(); i++) {
             Element e = (Element) catKeys.item(i);
-
-            FsmlModel.Variable v = new FsmlModel.Variable();
+            Variable v = new Variable();
             v.name = e.getAttribute("ShortName");
             v.type = "CATEGORICAL";
-
             NodeList cats = e.getElementsByTagName("CATEGORY");
             for (int j = 0; j < cats.getLength(); j++) {
                 v.categories.add(
                         ((Element) cats.item(j)).getAttribute("Value"));
             }
-
             model.variables.put(v.name, v);
         }
-    }
 
-    /* ---------------- Strategy & Tree ---------------- */
-
-    private static void parseStrategy(Document doc, FsmlModel model) {
-
+        // ---- Strategy / Root NODE ----
         Element strategy =
                 (Element) doc.getElementsByTagName("STRATEGY").item(0);
 
-        // Find top-level NODE (root)
-        NodeList children = strategy.getChildNodes();
-        for (int i = 0; i < children.getLength(); i++) {
-            Node n = children.item(i);
-
-            if (n instanceof Element
-                    && "NODE".equals(n.getNodeName())) {
-
-                model.root = parseNode((Element) n);
-                return;
-            }
-        }
-    }
-
-    /* ---------------- Recursive NODE parsing ---------------- */
-
-    private static FsmlModel.Node parseNode(Element nodeEl) {
-
-        FsmlModel.Node node = new FsmlModel.Node();
-        node.label = nodeEl.getAttribute("Label");
-
-        // Conditions
-        NodeList conds = nodeEl.getElementsByTagName("CONDITION");
-        for (int i = 0; i < conds.getLength(); i++) {
-
-            Element c = (Element) conds.item(i);
-
-            // IMPORTANT: only direct conditions
-            if (c.getParentNode() != nodeEl) continue;
-
-            FsmlModel.Condition cond = new FsmlModel.Condition();
-            cond.variable = c.getAttribute("DecisionKey");
-            cond.operator = c.getAttribute("Type");
-            cond.value = c.getAttribute("Value");
-
-            node.conditions.add(cond);
-        }
-
-        // Action (leaf)
-        NodeList actions = nodeEl.getElementsByTagName("ACTIONS");
-        for (int i = 0; i < actions.getLength(); i++) {
-            Element a = (Element) actions.item(i);
-            if (a.getParentNode() == nodeEl) {
-                node.action = a.getAttribute("Label");
+        NodeList kids = strategy.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            if (kids.item(i) instanceof Element
+                    && "NODE".equals(kids.item(i).getNodeName())) {
+                model.root = parseNode((Element) kids.item(i));
                 break;
             }
         }
 
-        // Child nodes
-        NodeList kids = nodeEl.getChildNodes();
-        for (int i = 0; i < kids.getLength(); i++) {
-            Node n = kids.item(i);
+        return model;
+    }
 
-            if (n instanceof Element
-                    && "NODE".equals(n.getNodeName())) {
+    static Node parseNode(Element el) {
+        Node n = new Node();
+        n.label = el.getAttribute("Label");
 
-                node.children.add(parseNode((Element) n));
+        NodeList children = el.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node c = children.item(i);
+
+            if (!(c instanceof Element)) continue;
+            Element e = (Element) c;
+
+            if ("CONDITION".equals(e.getTagName())) {
+                Condition cond = new Condition();
+                cond.variable = e.getAttribute("DecisionKey");
+                cond.operator = e.getAttribute("Type");
+                cond.value = e.getAttribute("Value");
+                n.conditions.add(cond);
+            }
+
+            if ("ACTIONS".equals(e.getTagName())) {
+                n.action = e.getAttribute("Label");
+            }
+
+            if ("NODE".equals(e.getTagName())) {
+                n.children.add(parseNode(e));
             }
         }
-
-        return node;
-    }
-}
-
-
-    public Map<String, Variable> variables = new HashMap<>();
-    public Node root;
-}
-
-
-public class Interval {
-    public double start;
-    public double end;
-
-    public Interval(double s, double e) {
-        this.start = s;
-        this.end = e;
+        return n;
     }
 
-    public Interval intersect(Interval other) {
-        double s = Math.max(start, other.start);
-        double e = Math.min(end, other.end);
-        return (s < e) ? new Interval(s, e) : null;
-    }
+    /* =========================================================
+       PATH EXTRACTION (CORE FIX)
+       ========================================================= */
 
-    public boolean contains(double v) {
-        return v >= start && v < end;
-    }
-}
-
-
-
-
-import java.util.*;
-
-public class DecisionPath {
-    public Map<String, Interval> numeric = new HashMap<>();
-    public Map<String, String> categorical = new HashMap<>();
-    public String action;
-    public String label;
-
-    public DecisionPath copy() {
-        DecisionPath p = new DecisionPath();
-        p.numeric.putAll(this.numeric);
-        p.categorical.putAll(this.categorical);
-        return p;
-    }
-}
-
-
-
-
-import java.util.*;
-
-public class PathAnalyzer {
-
-    static double resolve(FsmlModel.Variable v, String val) {
+    static double resolve(Variable v, String val) {
         if (val == null || val.isBlank()) return v.min;
         if ("LOW".equals(val)) return v.min;
         if ("HIGH".equals(val)) return v.max;
         return Double.parseDouble(val);
     }
 
-    public static List<DecisionPath> extractPaths(
-            FsmlModel model) {
-
+    static List<DecisionPath> extractPaths(Model model) {
         List<DecisionPath> paths = new ArrayList<>();
         walk(model.root, new DecisionPath(), model, paths);
         return paths;
     }
 
-    private static void walk(
-            FsmlModel.Node node,
-            DecisionPath current,
-            FsmlModel model,
-            List<DecisionPath> out) {
+    static void walk(Node node,
+                     DecisionPath current,
+                     Model model,
+                     List<DecisionPath> out) {
 
         DecisionPath next = current.copy();
 
-        for (FsmlModel.Condition c : node.conditions) {
-            FsmlModel.Variable v = model.variables.get(c.variable);
+        for (Condition c : node.conditions) {
+            Variable v = model.variables.get(c.variable);
+            if (v == null) continue;
 
             if ("NUMERIC".equals(v.type)) {
-                Interval i = next.numeric.getOrDefault(
-                        v.name,
-                        new Interval(v.min, v.max)
-                );
+                Interval base =
+                        next.numeric.getOrDefault(v.name,
+                                new Interval(v.min, v.max));
 
                 double val = resolve(v, c.value);
-                Interval local =
-                        ("ge".equals(c.operator) || "gt".equals(c.operator))
-                                ? new Interval(val, v.max)
-                                : new Interval(v.min, val);
+                Interval local;
 
-                Interval merged = i.intersect(local);
+                if ("ge".equals(c.operator) || "gt".equals(c.operator)) {
+                    local = new Interval(val, v.max);
+                } else {
+                    local = new Interval(v.min, val);
+                }
+
+                Interval merged = base.intersect(local);
                 if (merged == null) return; // DEAD PATH
                 next.numeric.put(v.name, merged);
-
             } else {
                 next.categorical.put(v.name, c.value);
             }
@@ -266,171 +234,86 @@ public class PathAnalyzer {
             return;
         }
 
-        for (FsmlModel.Node child : node.children) {
+        for (Node child : node.children) {
             walk(child, next, model, out);
         }
     }
-}
 
+    /* =========================================================
+       DECISION TABLE + HTML
+       ========================================================= */
 
+    static void generateDecisionTable(List<DecisionPath> paths)
+            throws Exception {
 
-static List<Interval> gaps(
-        Interval covered,
-        Interval universe) {
+        try (PrintWriter out =
+                     new PrintWriter("decision-table.csv")) {
 
-    List<Interval> g = new ArrayList<>();
-    if (covered.start > universe.start)
-        g.add(new Interval(universe.start, covered.start));
-    if (covered.end < universe.end)
-        g.add(new Interval(covered.end, universe.end));
-    return g;
-}
-
-
-
-
-import java.io.*;
-import java.util.*;
-
-public class JUnitTestGenerator {
-
-    public static void generate(
-            List<DecisionPath> paths,
-            File outFile) throws Exception {
-
-        try (PrintWriter out = new PrintWriter(outFile)) {
-
-            out.println("import org.junit.jupiter.api.*;");
-            out.println("import static org.junit.jupiter.api.Assertions.*;");
-            out.println("import java.util.*;");
-            out.println("class FsmlGeneratedTests {");
-
-            int i = 1;
-
-            // Positive tests
+            Set<String> cols = new LinkedHashSet<>();
             for (DecisionPath p : paths) {
-                out.println("@Test void positive_" + i++ + "() {");
-                out.println(" Map<String,Object> in = new HashMap<>();");
-
-                p.numeric.forEach((k,v) ->
-                        out.println(" in.put(\""+k+"\", "+(v.start+1)+");"));
-                p.categorical.forEach((k,v) ->
-                        out.println(" in.put(\""+k+"\", \""+v+"\");"));
-
-                out.println(" assertEquals(\""+p.action+"\", DecisionEngine.evaluate(in));");
-                out.println("}");
+                cols.addAll(p.numeric.keySet());
+                cols.addAll(p.categorical.keySet());
             }
 
-            // Negative GAP tests
-            for (DecisionPath p : paths) {
-                for (var e : p.numeric.entrySet()) {
-                    Interval iv = e.getValue();
-                    double probe = iv.start - 1;
+            for (String c : cols) out.print(c + ",");
+            out.println("ACTION");
 
-                    out.println("@Test void negative_gap_" + i++ + "() {");
-                    out.println(" Map<String,Object> in = new HashMap<>();");
-                    out.println(" in.put(\""+e.getKey()+"\", "+probe+");");
-                    out.println(" assertNull(DecisionEngine.evaluate(in));");
-                    out.println("}");
+            for (DecisionPath p : paths) {
+                for (String c : cols) {
+                    if (p.numeric.containsKey(c))
+                        out.print(p.numeric.get(c) + ",");
+                    else if (p.categorical.containsKey(c))
+                        out.print(p.categorical.get(c) + ",");
+                    else
+                        out.print("-,");
                 }
+                out.println(p.action);
             }
-            out.println("}");
         }
     }
-}
 
+    static void generateHtml(List<DecisionPath> paths)
+            throws Exception {
 
-
-import java.io.*;
-import java.util.*;
-
-public class HtmlReportGenerator {
-
-    public static void generate(
-            List<DecisionPath> paths,
-            File file) throws Exception {
-
-        try (PrintWriter out = new PrintWriter(file)) {
+        try (PrintWriter out =
+                     new PrintWriter("fsml-view.html")) {
 
             out.println("<html><body>");
-            out.println("<h2>FSML Decision Paths</h2>");
-            out.println("<ul>");
+            out.println("<h2>FSML Decision Paths</h2><ul>");
 
             for (DecisionPath p : paths) {
-                out.println("<li><b>" + p.label + "</b>");
-                out.println("<ul>");
-
-                p.numeric.forEach((k,v) ->
-                        out.println("<li>"+k+": "+v.start+" → "+v.end+"</li>"));
-                p.categorical.forEach((k,v) ->
-                        out.println("<li>"+k+" = "+v+"</li>"));
-
-                out.println("<li><b>ACTION:</b> "+p.action+"</li>");
+                out.println("<li><b>" + p.label + "</b><ul>");
+                p.numeric.forEach(
+                        (k, v) -> out.println("<li>" + k + " " + v + "</li>")
+                );
+                p.categorical.forEach(
+                        (k, v) -> out.println("<li>" + k + " = " + v + "</li>")
+                );
+                out.println("<li><b>ACTION:</b> " + p.action + "</li>");
                 out.println("</ul></li>");
             }
-
-            out.println("</ul>");
-            out.println("</body></html>");
+            out.println("</ul></body></html>");
         }
     }
-}
 
-
-
-import java.io.File;
-import java.util.*;
-
-public class Main {
+    /* =========================================================
+       MAIN
+       ========================================================= */
 
     public static void main(String[] args) throws Exception {
 
-        FsmlModel model =
-                FsmlParser.parse(new File("s.fsml"));
+        File fsml = new File("model.fsml"); // <-- your FSML file
+        Model model = parseFsml(fsml);
 
-        List<DecisionPath> paths =
-                PathAnalyzer.extractPaths(model);
+        List<DecisionPath> paths = extractPaths(model);
 
-        System.out.println("Total decision paths: " + paths.size());
+        System.out.println("Total paths: " + paths.size());
 
-        JUnitTestGenerator.generate(
-                paths, new File("FsmlGeneratedTests.java"));
+        generateDecisionTable(paths);
+        generateHtml(paths);
 
-        HtmlReportGenerator.generate(
-                paths, new File("fsml-view.html"));
+        System.out.println("Generated:");
+        System.out.println(" - decision-table.csv");
+        System.out.println(" - fsml-view.html");
     }
 }
-
-public class Interval {
-
-    public final double start;   // inclusive
-    public final double end;     // exclusive
-
-    // ✅ REQUIRED constructor
-    public Interval(double start, double end) {
-        if (start >= end) {
-            throw new IllegalArgumentException(
-                "Invalid interval: [" + start + ", " + end + ")"
-            );
-        }
-        this.start = start;
-        this.end = end;
-    }
-
-    // ✅ Intersection (path-aware logic)
-    public Interval intersect(Interval other) {
-        double s = Math.max(this.start, other.start);
-        double e = Math.min(this.end, other.end);
-        return (s < e) ? new Interval(s, e) : null;
-    }
-
-    // ✅ Containment check (coverage, reachability)
-    public boolean contains(double value) {
-        return value >= start && value < end;
-    }
-
-    @Override
-    public String toString() {
-        return "[" + start + ", " + end + ")";
-    }
-}
-
