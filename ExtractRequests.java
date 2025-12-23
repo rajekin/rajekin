@@ -1,95 +1,55 @@
 static void writeVisualHtml() throws Exception {
     PrintWriter out = new PrintWriter("fsml-visual.html");
 
-    out.println("<html>");
-    out.println("<head>");
-    out.println("<style>");
+    out.println("<html><head><style>");
     out.println("body { font-family: Arial; background:#f4f6f8; margin:20px; }");
-    out.println(".card { background:white; border-radius:8px; padding:12px; margin-bottom:14px;");
-    out.println("        box-shadow:0 2px 6px rgba(0,0,0,0.15); }");
-    out.println(".num { color:#2980b9; margin-left:12px; }");
-    out.println(".cat { color:#27ae60; margin-left:12px; }");
-    out.println(".action { color:#c0392b; font-weight:bold; margin-top:6px; }");
-    out.println("svg { background:white; border:1px solid #ccc; margin-bottom:30px; }");
-    out.println("</style>");
-    out.println("</head>");
-    out.println("<body>");
+    out.println(".rule { background:white; border-radius:8px; padding:14px; margin-bottom:16px;");
+    out.println("        box-shadow:0 2px 6px rgba(0,0,0,0.15); max-width:900px; }");
+    out.println(".title { font-weight:bold; margin-bottom:8px; color:#2c3e50; }");
+    out.println(".cond { margin-left:20px; margin-bottom:4px; }");
+    out.println(".num { color:#2980b9; }");
+    out.println(".cat { color:#27ae60; }");
+    out.println(".action { margin-top:10px; font-weight:bold; color:#c0392b; }");
+    out.println(".arrow { color:#7f8c8d; margin-right:6px; }");
+    out.println("</style></head><body>");
 
-    out.println("<h1>FSML Decision Paths – Visual</h1>");
-
-    /* ===== SVG FLOW ===== */
-
-    int svgHeight = paths.size() * 80 + 100;
-    out.println("<svg width='1400' height='" + svgHeight + "'>");
-
-    int y = 40;
-    for (Path p : paths) {
-        int x = 40;
-
-        out.println("<circle cx='" + x + "' cy='" + y + "' r='5' fill='#34495e'/>");
-
-        for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
-            int nx = x + 180;
-
-            out.println("<line x1='" + x + "' y1='" + y +
-                        "' x2='" + nx + "' y2='" + y +
-                        "' stroke='#555'/>");
-
-            out.println("<rect x='" + (nx - 70) + "' y='" + (y - 18) +
-                        "' width='140' height='36' rx='6' fill='#ecf0f1'/>");
-
-            out.println("<text x='" + nx + "' y='" + (y + 5) +
-                        "' text-anchor='middle' font-size='11'>" +
-                        esc(e.getKey() + " " + e.getValue()) +
-                        "</text>");
-
-            x = nx;
-        }
-
-        int ax = x + 200;
-        out.println("<line x1='" + x + "' y1='" + y +
-                    "' x2='" + ax + "' y2='" + y +
-                    "' stroke='#555'/>");
-
-        out.println("<rect x='" + (ax - 80) + "' y='" + (y - 20) +
-                    "' width='160' height='40' rx='8' fill='#f9e79f' stroke='#d35400'/>");
-
-        out.println("<text x='" + ax + "' y='" + (y + 6) +
-                    "' text-anchor='middle' font-size='12'>" +
-                    esc(p.action) +
-                    "</text>");
-
-        y += 80;
-    }
-
-    out.println("</svg>");
-
-    /* ===== PATH CARDS ===== */
+    out.println("<h1>FSML Decision Paths</h1>");
+    out.println("<p>Vertical, path-based view (conditions shown in evaluation order)</p>");
 
     int r = 1;
     for (Path p : paths) {
-        out.println("<div class='card'>");
-        out.println("<b>Rule " + (r++) + "</b>");
+        out.println("<div class='rule'>");
+        out.println("<div class='title'>Rule " + (r++) + "</div>");
 
+        // Numeric conditions
         for (Map.Entry<String, Interval> e : p.numeric.entrySet()) {
-            out.println("<div class='num'>" +
-                        esc(e.getKey() + " " + e.getValue()) +
-                        "</div>");
+            Interval i = e.getValue();
+
+            // Skip full-domain noise
+            Variable v = variables.get(e.getKey());
+            if (v != null && i.min == v.min && i.max == v.max) continue;
+
+            out.println("<div class='cond num'>");
+            out.println("<span class='arrow'>➜</span>");
+            out.println(esc(e.getKey()) + " " + esc(i.toString()));
+            out.println("</div>");
         }
 
+        // Categorical conditions
         for (Map.Entry<String, String> e : p.categorical.entrySet()) {
-            out.println("<div class='cat'>" +
-                        esc(e.getKey() + " = " + e.getValue()) +
-                        "</div>");
+            out.println("<div class='cond cat'>");
+            out.println("<span class='arrow'>➜</span>");
+            out.println(esc(e.getKey()) + " = " + esc(e.getValue()));
+            out.println("</div>");
         }
 
-        out.println("<div class='action'>ACTION → " +
-                    esc(p.action) +
-                    "</div>");
+        out.println("<div class='action'>");
+        out.println("✔ ACTION → " + esc(p.action));
+        out.println("</div>");
+
         out.println("</div>");
     }
 
-    out.println("</body>");
-    out.println("</html>");
+    out.println("</body></html>");
     out.close();
 }
