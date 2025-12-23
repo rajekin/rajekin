@@ -1,12 +1,75 @@
-import java.util.Map;
+import java.util.*;
 
-public class TestCase {
-    public Map<String, Object> inputs;
-    public String expectedAction;
+public class GapAnalyzer {
 
-    public TestCase(Map<String, Object> inputs, String expectedAction) {
-        this.inputs = inputs;
-        this.expectedAction = expectedAction;
+    public static List<String> analyze(FsmlModel model) {
+        List<String> gaps = new ArrayList<>();
+
+        // 1️⃣ Variable used but not defined
+        for (FsmlModel.RuleNode node : model.nodes) {
+            for (String var : node.conditions.keySet()) {
+                if (!model.variables.containsKey(var)) {
+                    gaps.add("Variable used but not defined: " + var);
+                }
+            }
+        }
+
+        // 2️⃣ Node without action (leaf gap)
+        for (FsmlModel.RuleNode node : model.nodes) {
+            if (node.action == null || node.action.isBlank()) {
+                gaps.add("Node has no ACTION (leaf gap): " + node.label);
+            }
+        }
+
+        // 3️⃣ Numeric boundary coverage
+        for (FsmlModel.Variable var : model.variables.values()) {
+            if (!"NUMERIC".equals(var.type)) continue;
+
+            boolean hasLow = false;
+            boolean hasHigh = false;
+
+            for (FsmlModel.RuleNode node : model.nodes) {
+                List<FsmlModel.Condition> conds = node.conditions.get(var.name);
+                if (conds == null) continue;
+
+                for (FsmlModel.Condition c : conds) {
+                    if ("LOW".equals(c.value) || "ge".equals(c.operator)) {
+                        hasLow = true;
+                    }
+                    if ("HIGH".equals(c.value) || "lt".equals(c.operator)) {
+                        hasHigh = true;
+                    }
+                }
+            }
+
+            if (!hasLow || !hasHigh) {
+                gaps.add("Incomplete numeric range coverage for: " + var.name);
+            }
+        }
+
+        // 4️⃣ Categorical coverage gaps
+        for (FsmlModel.Variable var : model.variables.values()) {
+            if (!"CATEGORICAL".equals(var.type)) continue;
+
+            Set<String> used = new HashSet<>();
+
+            for (FsmlModel.RuleNode node : model.nodes) {
+                List<FsmlModel.Condition> conds = node.conditions.get(var.name);
+                if (conds == null) continue;
+                for (FsmlModel.Condition c : conds) {
+                    used.add(c.value);
+                }
+            }
+
+            for (String category : var.categories) {
+                if (!used.contains(category)) {
+                    gaps.add("Category not handled: " +
+                            var.name + " = " + category);
+                }
+            }
+        }
+
+        return gaps;
     }
 }
 
@@ -20,17 +83,38 @@ public class TestCaseGenerator {
         List<TestCase> tests = new ArrayList<>();
 
         for (FsmlModel.RuleNode node : model.nodes) {
-            Map<String, Object> input = new HashMap<>();
 
-            for (Map.Entry<String, List<FsmlModel.Condition>> e : node.conditions.entrySet()) {
-                FsmlModel.Variable v = model.variables.get(e.getKey());
-                FsmlModel.Condition c = e.getValue().get(0);
+            // Skip nodes without actions (important)
+            if (node.action == null) continue;
 
-                if ("NUMERIC".equals(v.type)) {
-                    double val = Double.parseDouble(c.value.equals("LOW") ? "1" : c.value.equals("HIGH") ? "9999" : c.value);
-                    input.put(v.name, val);
+            Map<String, Object> input = new LinkedHashMap<>();
+
+            for (var entry : node.conditions.entrySet()) {
+                String varName = entry.getKey();
+                FsmlModel.Variable var = model.variables.get(varName);
+
+                if (var == null) continue; // gap handled elsewhere
+
+                FsmlModel.Condition cond = entry.getValue().get(0);
+
+                if ("NUMERIC".equals(var.type)) {
+                    double val = resolveNumericValue(
+                            var,
+                            cond.value,
+                            cond.operator
+                    );
+
+                    // Boundary nudging for better tests
+                    if ("lt".equals(cond.operator)) {
+                        val = val - 1;
+                    } else if ("ge".equals(cond.operator)) {
+                        val = val + 1;
+                    }
+
+                    input.put(varName, val);
+
                 } else {
-                    input.put(v.name, c.value);
+                    input.put(varName, cond.value);
                 }
             }
 
@@ -41,49 +125,19 @@ public class TestCaseGenerator {
     }
 }
 
+private static double resolveNumericValue(
+        FsmlModel.Variable var,
+        String value,
+        String operator) {
 
-
-
-import java.io.File;
-import java.util.List;
-
-public class FsmlAnalyzerMain {
-
-    public static void main(String[] args) throws Exception {
-        File fsml = new File("PenFed_AR_Expert_09042025.fsml");
-
-        FsmlModel model = FsmlParser.parse(fsml);
-
-        System.out.println("---- GAPS ----");
-        GapAnalyzer.analyze(model).forEach(System.out::println);
-
-        System.out.println("\n---- TEST CASES ----");
-        List<TestCase> tests = TestCaseGenerator.generate(model);
-        for (TestCase tc : tests) {
-            System.out.println(tc.inputs + " -> " + tc.expectedAction);
-        }
+    if (value == null || value.isBlank()) {
+        // Safe default for empty values
+        return var.min;
     }
+
+    return switch (value) {
+        case "LOW"  -> var.min;
+        case "HIGH" -> var.max;
+        default     -> Double.parseDouble(value);
+    };
 }
-
-
-import java.io.File;
-import java.util.List;
-
-public class FsmlAnalyzerMain {
-
-    public static void main(String[] args) throws Exception {
-        File fsml = new File("PenFed_AR_Expert_09042025.fsml");
-
-        FsmlModel model = FsmlParser.parse(fsml);
-
-        System.out.println("---- GAPS ----");
-        GapAnalyzer.analyze(model).forEach(System.out::println);
-
-        System.out.println("\n---- TEST CASES ----");
-        List<TestCase> tests = TestCaseGenerator.generate(model);
-        for (TestCase tc : tests) {
-            System.out.println(tc.inputs + " -> " + tc.expectedAction);
-        }
-    }
-}
-
