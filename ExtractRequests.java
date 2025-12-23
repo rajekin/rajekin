@@ -3,9 +3,13 @@ import javax.xml.parsers.*;
 import java.io.*;
 import java.util.*;
 
+/**
+ * FSML ANALYZER – SINGLE FILE, JAVA 21 SAFE
+ * Works with real FICO FSML exports
+ */
 public class FsmlAnalyzerAllInOne {
 
-    /* ===================== MODEL ===================== */
+    /* ===================== DATA MODEL ===================== */
 
     static class Variable {
         String name;
@@ -25,15 +29,13 @@ public class FsmlAnalyzerAllInOne {
         String label;
         List<Condition> conditions = new ArrayList<>();
         List<FsmlNode> children = new ArrayList<>();
-        String action;
+        String action; // resolved decision outcome (if any)
     }
 
     static class Model {
         Map<String, Variable> variables = new LinkedHashMap<>();
         FsmlNode root;
     }
-
-    /* ===================== INTERVAL ===================== */
 
     static class Interval {
         double start; // inclusive
@@ -44,23 +46,17 @@ public class FsmlAnalyzerAllInOne {
             this.end = e;
         }
 
-        boolean isEmpty() {
-            return start >= end;
-        }
-
         Interval intersect(Interval other) {
             double s = Math.max(this.start, other.start);
             double e = Math.min(this.end, other.end);
-            Interval i = new Interval(s, e);
-            return i.isEmpty() ? null : i;
+            if (s >= e) return null; // dead interval
+            return new Interval(s, e);
         }
 
         public String toString() {
             return "[" + start + "," + end + ")";
         }
     }
-
-    /* ===================== PATH ===================== */
 
     static class DecisionPath {
         Map<String, Interval> numeric = new LinkedHashMap<>();
@@ -76,7 +72,7 @@ public class FsmlAnalyzerAllInOne {
         }
     }
 
-    /* ===================== PARSER ===================== */
+    /* ===================== FSML PARSER ===================== */
 
     static Model parseFsml(File fsmlFile) throws Exception {
 
@@ -89,26 +85,29 @@ public class FsmlAnalyzerAllInOne {
 
         Model model = new Model();
 
-        // ---- Numeric keys
+        /* ---- DecisionArea ---- */
+
         NodeList numericKeys = doc.getElementsByTagName("NumericKey");
         for (int i = 0; i < numericKeys.getLength(); i++) {
             Element e = (Element) numericKeys.item(i);
             Variable v = new Variable();
             v.name = e.getAttribute("ShortName");
             v.type = "NUMERIC";
+
             Element r = (Element) e.getElementsByTagName("NumericRange").item(0);
             v.min = Double.parseDouble(r.getAttribute("minValue"));
             v.max = Double.parseDouble(r.getAttribute("maxValue"));
+
             model.variables.put(v.name, v);
         }
 
-        // ---- Categorical keys
         NodeList catKeys = doc.getElementsByTagName("CategoricalKey");
         for (int i = 0; i < catKeys.getLength(); i++) {
             Element e = (Element) catKeys.item(i);
             Variable v = new Variable();
             v.name = e.getAttribute("ShortName");
             v.type = "CATEGORICAL";
+
             NodeList cats = e.getElementsByTagName("CATEGORY");
             for (int j = 0; j < cats.getLength(); j++) {
                 v.categories.add(((Element) cats.item(j)).getAttribute("Value"));
@@ -116,12 +115,13 @@ public class FsmlAnalyzerAllInOne {
             model.variables.put(v.name, v);
         }
 
-        // ---- Strategy root
-        Element strategy = (Element) doc.getElementsByTagName("STRATEGY").item(0);
-        NodeList children = strategy.getChildNodes();
+        /* ---- STRATEGY ROOT ---- */
 
-        for (int i = 0; i < children.getLength(); i++) {
-            org.w3c.dom.Node n = children.item(i);
+        Element strategy = (Element) doc.getElementsByTagName("STRATEGY").item(0);
+        NodeList kids = strategy.getChildNodes();
+
+        for (int i = 0; i < kids.getLength(); i++) {
+            org.w3c.dom.Node n = kids.item(i);
             if (n instanceof Element && "NODE".equals(n.getNodeName())) {
                 model.root = parseNode((Element) n);
                 break;
@@ -136,14 +136,15 @@ public class FsmlAnalyzerAllInOne {
         FsmlNode node = new FsmlNode();
         node.label = el.getAttribute("Label");
 
-        NodeList kids = el.getChildNodes();
-        for (int i = 0; i < kids.getLength(); i++) {
+        NodeList children = el.getChildNodes();
 
-            org.w3c.dom.Node dom = kids.item(i);
+        for (int i = 0; i < children.getLength(); i++) {
+            org.w3c.dom.Node dom = children.item(i);
             if (!(dom instanceof Element)) continue;
 
             Element e = (Element) dom;
 
+            // Only DIRECT child conditions
             if ("CONDITION".equals(e.getTagName())
                     && e.getParentNode() == el) {
 
@@ -154,12 +155,29 @@ public class FsmlAnalyzerAllInOne {
                 node.conditions.add(c);
             }
 
-            if ("ACTIONS".equals(e.getTagName())
+            // ACTION
+            if ("ACTION".equals(e.getTagName())
                     && e.getParentNode() == el) {
-
                 node.action = e.getAttribute("Label");
             }
 
+            // ACTIONS/ACTION
+            if ("ACTIONS".equals(e.getTagName())
+                    && e.getParentNode() == el) {
+                NodeList acts = e.getElementsByTagName("ACTION");
+                if (acts.getLength() > 0) {
+                    node.action =
+                            ((Element) acts.item(0)).getAttribute("Label");
+                }
+            }
+
+            // DECISION (variant)
+            if ("DECISION".equals(e.getTagName())
+                    && e.getParentNode() == el) {
+                node.action = e.getAttribute("Label");
+            }
+
+            // Child NODEs
             if ("NODE".equals(e.getTagName())) {
                 node.children.add(parseNode(e));
             }
@@ -169,11 +187,11 @@ public class FsmlAnalyzerAllInOne {
 
     /* ===================== PATH EXTRACTION ===================== */
 
-    static double resolve(Variable v, String val) {
-        if (val == null || val.isBlank()) return v.min;
-        if ("LOW".equals(val)) return v.min;
-        if ("HIGH".equals(val)) return v.max;
-        return Double.parseDouble(val);
+    static double resolve(Variable v, String value) {
+        if (value == null || value.isBlank()) return v.min;
+        if ("LOW".equals(value)) return v.min;
+        if ("HIGH".equals(value)) return v.max;
+        return Double.parseDouble(value);
     }
 
     static List<DecisionPath> extractPaths(Model model) {
@@ -196,8 +214,7 @@ public class FsmlAnalyzerAllInOne {
             if ("NUMERIC".equals(v.type)) {
                 Interval base =
                         next.numeric.getOrDefault(
-                                v.name,
-                                new Interval(v.min, v.max));
+                                v.name, new Interval(v.min, v.max));
 
                 double val = resolve(v, c.value);
                 Interval local;
@@ -217,8 +234,11 @@ public class FsmlAnalyzerAllInOne {
             }
         }
 
-        if (node.action != null) {
-            next.action = node.action;
+        boolean isLeaf = node.children.isEmpty();
+
+        if (isLeaf) {
+            next.action =
+                    (node.action != null ? node.action : "NO_ACTION_DEFINED");
             next.label = node.label;
             out.add(next);
             return;
@@ -231,9 +251,11 @@ public class FsmlAnalyzerAllInOne {
 
     /* ===================== OUTPUT ===================== */
 
-    static void generateDecisionTable(List<DecisionPath> paths) throws Exception {
+    static void generateDecisionTable(List<DecisionPath> paths)
+            throws Exception {
 
-        try (PrintWriter out = new PrintWriter("decision-table.csv")) {
+        try (PrintWriter out =
+                     new PrintWriter("decision-table.csv")) {
 
             Set<String> cols = new LinkedHashSet<>();
             for (DecisionPath p : paths) {
@@ -258,20 +280,25 @@ public class FsmlAnalyzerAllInOne {
         }
     }
 
-    static void generateHtml(List<DecisionPath> paths) throws Exception {
+    static void generateHtml(List<DecisionPath> paths)
+            throws Exception {
 
-        try (PrintWriter out = new PrintWriter("fsml-view.html")) {
+        try (PrintWriter out =
+                     new PrintWriter("fsml-view.html")) {
+
             out.println("<html><body>");
             out.println("<h2>FSML Decision Paths</h2><ul>");
+
             for (DecisionPath p : paths) {
                 out.println("<li><b>" + p.label + "</b><ul>");
-                p.numeric.forEach((k, v) ->
-                        out.println("<li>" + k + " " + v + "</li>"));
-                p.categorical.forEach((k, v) ->
-                        out.println("<li>" + k + " = " + v + "</li>"));
+                p.numeric.forEach(
+                        (k, v) -> out.println("<li>" + k + " " + v + "</li>"));
+                p.categorical.forEach(
+                        (k, v) -> out.println("<li>" + k + " = " + v + "</li>"));
                 out.println("<li><b>ACTION:</b> " + p.action + "</li>");
                 out.println("</ul></li>");
             }
+
             out.println("</ul></body></html>");
         }
     }
