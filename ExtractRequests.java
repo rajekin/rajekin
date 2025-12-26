@@ -1,7 +1,9 @@
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.xml.sax.InputSource;
 
 import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.transform.*;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
@@ -9,73 +11,177 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-public class XmlToJsonWithXsltFolder {
+public class XmlToJsonXsltFolder {
 
+    /**
+     * Usage:
+     *   java XmlToJsonXsltFolder <xsltDir> <inputXml> <outputJson> [--dump=<folder>] [--strictXmlPipeline=true|false]
+     *
+     * Notes:
+     * - XSLT pipeline MUST stay XML until the final step. If any step outputs JSON/text and there are more XSLTs,
+     *   you’ll get “Content is not allowed in prolog” (because JSON is not XML).
+     * - Control order by naming: 01-*.xslt, 02-*.xslt, 03-*.xslt
+     */
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.err.println("Usage: java XmlToJsonWithXsltFolder <xsltDir> <inputXml> <outputJson>");
-            System.err.println("Example: java XmlToJsonWithXsltFolder ./xslts ./input.xml ./out.json");
+            System.err.println("Usage: java XmlToJsonXsltFolder <xsltDir> <inputXml> <outputJson> [--dump=<folder>] [--strictXmlPipeline=true|false]");
             System.exit(2);
         }
 
         Path xsltDir = Paths.get(args[0]);
-        Path inputXml = Paths.get(args[1]);
-        Path outputJson = Paths.get(args[2]);
+        Path inputXmlPath = Paths.get(args[1]);
+        Path outputJsonPath = Paths.get(args[2]);
+
+        Path dumpDir = null;
+        boolean strictXmlPipeline = true; // recommended
+
+        for (int i = 3; i < args.length; i++) {
+            String a = args[i].trim();
+            if (a.startsWith("--dump=")) {
+                dumpDir = Paths.get(a.substring("--dump=".length()));
+            } else if (a.startsWith("--strictXmlPipeline=")) {
+                strictXmlPipeline = Boolean.parseBoolean(a.substring("--strictXmlPipeline=".length()));
+            }
+        }
 
         List<Path> xsltFiles = listXsltFiles(xsltDir);
         if (xsltFiles.isEmpty()) {
             throw new IllegalArgumentException("No .xsl/.xslt files found in: " + xsltDir.toAbsolutePath());
         }
 
-        // Start with the original XML as a string (so we can chain transforms in-memory)
-        String current = Files.readString(inputXml, StandardCharsets.UTF_8);
+        if (dumpDir != null) Files.createDirectories(dumpDir);
+
+        // Read and sanitize initial XML (BOM / junk before '<')
+        String current = Files.readString(inputXmlPath, StandardCharsets.UTF_8);
+        current = sanitizeXmlLikeInput(current);
+
+        if (!looksLikeXml(current) || !isWellFormedXml(current)) {
+            throw new IllegalStateException(
+                    "Input file does not look like well-formed XML after sanitization.\n" +
+                    "First 200 chars:\n" + preview(current, 200));
+        }
 
         TransformerFactory tf = newSecureTransformerFactory();
 
-        // Compile templates for each XSLT (faster and also validates early)
-        List<Templates> pipeline = new ArrayList<>();
+        List<Templates> templates = new ArrayList<>();
+        List<String> outputMethods = new ArrayList<>();
+
         for (Path xslt : xsltFiles) {
             StreamSource xsltSource = new StreamSource(xslt.toFile());
-            // Important: set systemId so xsl:include/xsl:import relative paths resolve correctly
+            // Important for xsl:include/import relative resolution
             xsltSource.setSystemId(xslt.toUri().toString());
-            pipeline.add(tf.newTemplates(xsltSource));
+
+            templates.add(tf.newTemplates(xsltSource));
+            outputMethods.add(detectXsltOutputMethod(xslt)); // xml/html/text/unknown
         }
 
-        // Apply each XSLT in order
-        for (int i = 0; i < pipeline.size(); i++) {
-            Templates t = pipeline.get(i);
-            String transformed = transformToString(t, current);
-            current = transformed;
-            // Optional: uncomment to debug intermediate outputs
-            // System.out.println("After XSLT " + (i+1) + ":\n" + current);
+        String finalText = null;
+
+        for (int i = 0; i < templates.size(); i++) {
+            Path xsltFile = xsltFiles.get(i);
+            String method = outputMethods.get(i);
+
+            // Ensure we only feed XML into an XSLT transform
+            current = sanitizeXmlLikeInput(current);
+            boolean currentIsXml = looksLikeXml(current) && isWellFormedXml(current);
+
+            if (!currentIsXml) {
+                String msg =
+                        "Step " + (i + 1) + " cannot run because the current pipeline content is NOT XML.\n" +
+                        "This usually means an earlier XSLT already output JSON/text.\n" +
+                        "Current content starts with: " + preview(firstNonWs(current), 60) + "\n" +
+                        "Next XSLT file: " + xsltFile.getFileName() + "\n";
+                if (strictXmlPipeline) throw new IllegalStateException(msg);
+            }
+
+            String transformed;
+            try {
+                transformed = transformToString(templates.get(i), current);
+            } catch (TransformerException te) {
+                // Add extra diagnostics for “Content is not allowed in prolog”
+                String head = preview(firstNonWs(current), 120);
+                throw new IllegalStateException(
+                        "XSLT transform failed at step " + (i + 1) + " using " + xsltFile.getFileName() + "\n" +
+                        "XSLT declared output method: " + method + "\n" +
+                        "Input starts with: " + head + "\n" +
+                        "If you see JSON/text here, ensure ONLY the FINAL XSLT outputs JSON/text.\n",
+                        te
+                );
+            }
+
+            if (dumpDir != null) {
+                String dumpName = String.format("%02d_%s.out", (i + 1), stripExt(xsltFile.getFileName().toString()));
+                Files.writeString(dumpDir.resolve(dumpName), transformed, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            }
+
+            String transformedTrim = firstNonWs(transformed);
+            boolean producedJsonLike = transformedTrim.startsWith("{") || transformedTrim.startsWith("[");
+            boolean producedText = "text".equalsIgnoreCase(method) || producedJsonLike;
+
+            if (producedText) {
+                finalText = transformed;
+                if (i != templates.size() - 1) {
+                    throw new IllegalStateException(
+                            "Your pipeline produced JSON/text at step " + (i + 1) + " (" + xsltFile.getFileName() + "),\n" +
+                            "but there are more XSLTs after it.\n\n" +
+                            "Fix: ensure all earlier XSLTs output XML, and ONLY the last one outputs JSON/text.\n" +
+                            "Output starts with: " + preview(transformedTrim, 120) + "\n"
+                    );
+                }
+            } else {
+                // Continue as XML
+                current = transformed;
+            }
         }
 
-        // Expect final output to be JSON text
-        String jsonText = current.trim();
+        if (finalText == null) {
+            // Pipeline ended with XML; that means your last XSLT didn't output JSON.
+            String endTrim = firstNonWs(current);
+            throw new IllegalStateException(
+                    "Pipeline completed but did not produce JSON/text output.\n" +
+                    "Last output looks like XML (starts with): " + preview(endTrim, 120) + "\n" +
+                    "Fix: make the final XSLT output JSON with <xsl:output method=\"text\" encoding=\"UTF-8\"/>"
+            );
+        }
 
         // Validate + pretty print JSON
+        String jsonText = finalText.trim();
         ObjectMapper mapper = new ObjectMapper();
+
         JsonNode node;
         try {
             node = mapper.readTree(jsonText);
         } catch (Exception e) {
             throw new IllegalStateException(
-                    "Final transform output is not valid JSON. " +
-                    "If your last XSLT outputs XML, you’ll need an XML->JSON step.\n" +
-                    "First 300 chars of output:\n" + preview(jsonText, 300), e);
+                    "Final output is not valid JSON.\n" +
+                    "First 300 chars:\n" + preview(jsonText, 300) + "\n" +
+                    "If your last XSLT outputs XML, you need an XML->JSON step or change the last XSLT.\n",
+                    e
+            );
         }
 
-        Files.createDirectories(outputJson.toAbsolutePath().getParent());
+        Files.createDirectories(outputJsonPath.toAbsolutePath().getParent());
         String pretty = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
-        Files.writeString(outputJson, pretty, StandardCharsets.UTF_8,
+        Files.writeString(outputJsonPath, pretty, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
 
-        System.out.println("Done. Applied " + pipeline.size() + " XSLT(s). Output: " + outputJson.toAbsolutePath());
-        System.out.println("XSLT order:");
-        for (Path p : xsltFiles) System.out.println(" - " + p.getFileName());
+        System.out.println("Done.");
+        System.out.println("Applied XSLTs in order:");
+        for (int i = 0; i < xsltFiles.size(); i++) {
+            System.out.println("  " + (i + 1) + ". " + xsltFiles.get(i).getFileName() + " (method=" + outputMethods.get(i) + ")");
+        }
+        if (dumpDir != null) {
+            System.out.println("Intermediate outputs dumped to: " + dumpDir.toAbsolutePath());
+        }
+        System.out.println("Output JSON: " + outputJsonPath.toAbsolutePath());
     }
+
+    // -------------------- Core helpers --------------------
 
     private static List<Path> listXsltFiles(Path xsltDir) throws IOException {
         if (!Files.isDirectory(xsltDir)) {
@@ -93,38 +199,48 @@ public class XmlToJsonWithXsltFolder {
         }
     }
 
+    /** Removes UTF-8 BOM and trims junk before first '<' (common cause of "Content is not allowed in prolog"). */
+    private static String sanitizeXmlLikeInput(String s) {
+        if (s == null) return null;
+        s = s.replace("\uFEFF", ""); // BOM
+        int idx = s.indexOf('<');
+        if (idx > 0) {
+            // Drop any junk before the first '<'
+            s = s.substring(idx);
+        }
+        return s;
+    }
+
     private static TransformerFactory newSecureTransformerFactory() {
         TransformerFactory tf = TransformerFactory.newInstance();
-
-        // Harden XML/XSLT processing (prevents XXE / external entity access)
         try { tf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) {}
-
-        // Block external DTDs and stylesheets where supported
         try { tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, ""); } catch (Exception ignored) {}
         try { tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, ""); } catch (Exception ignored) {}
-
-        // Optional: custom URIResolver if you want to control include/import loading.
-        // Default works when systemId is set (we do that).
-        // tf.setURIResolver((href, base) -> null);
-
         return tf;
     }
 
-    private static String transformToString(Templates templates, String inputXmlOrText) throws TransformerException {
+    private static String transformToString(Templates templates, String inputXml) throws TransformerException {
         Transformer transformer = templates.newTransformer();
-
-        // If your XSLTs need params, set them here:
-        // transformer.setParameter("someParam", "value");
-
-        StreamSource in = new StreamSource(new StringReader(inputXmlOrText));
+        StreamSource in = new StreamSource(new StringReader(inputXml));
         StringWriter out = new StringWriter();
         transformer.transform(in, new StreamResult(out));
         return out.toString();
     }
 
-    private static String preview(String s, int max) {
-        if (s == null) return "";
-        s = s.replace("\r", "");
-        return s.length() <= max ? s : s.substring(0, max) + " ...";
+    /** Fast heuristic (doesn't guarantee validity). */
+    private static boolean looksLikeXml(String s) {
+        if (s == null) return false;
+        String t = firstNonWs(s);
+        return t.startsWith("<");
     }
-}
+
+    /** Validates XML well-formedness by parsing (securely). */
+    private static boolean isWellFormedXml(String xml) {
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setNamespaceAware(true);
+
+            // Secure XML parsing
+            try { dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) {}
+            try { dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true); } catch (Exception ignored) {}
+            try { dbf.setFeature("http://xml.org/sax/features/external
