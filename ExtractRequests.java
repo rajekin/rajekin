@@ -243,4 +243,51 @@ public class XmlToJsonXsltFolder {
             // Secure XML parsing
             try { dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) {}
             try { dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true); } catch (Exception ignored) {}
-            try { dbf.setFeature("http://xml.org/sax/features/external
+            try { dbf.setFeature("http://xml.org/sax/features/external-general-entities", false); } catch (Exception ignored) {}
+            try { dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false); } catch (Exception ignored) {}
+            try { dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, ""); } catch (Exception ignored) {}
+            try { dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, ""); } catch (Exception ignored) {}
+
+            var db = dbf.newDocumentBuilder();
+            db.parse(new InputSource(new StringReader(xml)));
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Attempts to detect <xsl:output method="..."> from an XSLT file.
+     * Returns: "xml", "html", "text", or "unknown"
+     */
+    private static String detectXsltOutputMethod(Path xsltFile) {
+        try {
+            String xslt = Files.readString(xsltFile, StandardCharsets.UTF_8);
+            // simple regex is enough for detection (not full parsing)
+            Pattern p = Pattern.compile("<\\s*xsl:output\\b[^>]*\\bmethod\\s*=\\s*['\"](xml|html|text)['\"][^>]*>",
+                    Pattern.CASE_INSENSITIVE);
+            Matcher m = p.matcher(xslt);
+            if (m.find()) return m.group(1).toLowerCase(Locale.ROOT);
+        } catch (Exception ignored) {}
+        return "unknown";
+    }
+
+    private static String firstNonWs(String s) {
+        if (s == null) return "";
+        int i = 0;
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        return s.substring(i);
+    }
+
+    private static String preview(String s, int max) {
+        if (s == null) return "";
+        s = s.replace("\r", "");
+        if (s.length() <= max) return s;
+        return s.substring(0, max) + " ...";
+    }
+
+    private static String stripExt(String name) {
+        int dot = name.lastIndexOf('.');
+        return (dot > 0) ? name.substring(0, dot) : name;
+    }
+}
