@@ -1,293 +1,217 @@
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.xml.sax.InputSource;
-
-import javax.xml.XMLConstants;
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.*;
-import javax.xml.transform.stream.StreamResult;
-import javax.xml.transform.stream.StreamSource;
+import org.w3c.dom.*;
+import javax.xml.parsers.*;
 import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.*;
 import java.util.*;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-public class XmlToJsonXsltFolder {
+public class FsmlAnalyzerAllInOne {
 
-    /**
-     * Usage:
-     *   java XmlToJsonXsltFolder <xsltDir> <inputXml> <outputJson> [--dump=<folder>] [--strictXmlPipeline=true|false]
-     *
-     * Notes:
-     * - XSLT pipeline MUST stay XML until the final step. If any step outputs JSON/text and there are more XSLTs,
-     *   you’ll get “Content is not allowed in prolog” (because JSON is not XML).
-     * - Control order by naming: 01-*.xslt, 02-*.xslt, 03-*.xslt
-     */
-    public static void main(String[] args) throws Exception {
-        if (args.length < 3) {
-            System.err.println("Usage: java XmlToJsonXsltFolder <xsltDir> <inputXml> <outputJson> [--dump=<folder>] [--strictXmlPipeline=true|false]");
-            System.exit(2);
+    /* ===================== DATA MODELS ===================== */
+
+    static class Condition {
+        String key;
+        String op;
+        String value;
+
+        public String toString() {
+            return key + " " + op + " " + value;
         }
+    }
 
-        Path xsltDir = Paths.get(args[0]);
-        Path inputXmlPath = Paths.get(args[1]);
-        Path outputJsonPath = Paths.get(args[2]);
+    static class Path {
+        List<Condition> conditions = new ArrayList<>();
+        String action;
 
-        Path dumpDir = null;
-        boolean strictXmlPipeline = true; // recommended
+        String signature() {
+            return conditions.stream()
+                    .map(c -> c.key + c.op + c.value)
+                    .sorted()
+                    .collect(Collectors.joining("|")) + "->" + action;
+        }
+    }
 
-        for (int i = 3; i < args.length; i++) {
-            String a = args[i].trim();
-            if (a.startsWith("--dump=")) {
-                dumpDir = Paths.get(a.substring("--dump=".length()));
-            } else if (a.startsWith("--strictXmlPipeline=")) {
-                strictXmlPipeline = Boolean.parseBoolean(a.substring("--strictXmlPipeline=".length()));
+    static class NumericRange {
+        double min, max;
+        NumericRange(double min, double max) { this.min = min; this.max = max; }
+    }
+
+    /* ===================== STATE ===================== */
+
+    static List<Path> paths = new ArrayList<>();
+
+    /* ===================== XML HELPERS ===================== */
+
+    static List<Element> children(Element e, String tag) {
+        List<Element> out = new ArrayList<>();
+        NodeList nl = e.getChildNodes();
+        for (int i = 0; i < nl.getLength(); i++) {
+            Node n = nl.item(i);
+            if (n instanceof Element el && el.getNodeName().equalsIgnoreCase(tag)) {
+                out.add(el);
             }
         }
+        return out;
+    }
 
-        List<Path> xsltFiles = listXsltFiles(xsltDir);
-        if (xsltFiles.isEmpty()) {
-            throw new IllegalArgumentException("No .xsl/.xslt files found in: " + xsltDir.toAbsolutePath());
+    /* ===================== FSML WALK ===================== */
+
+    static void walk(Element node, List<Condition> inherited) {
+        if (node == null) return;
+
+        List<Condition> local = new ArrayList<>(inherited);
+
+        for (Element c : children(node, "CONDITION")) {
+            Condition cond = new Condition();
+            cond.key = c.getAttribute("DecisionKey");
+            cond.op  = c.getAttribute("Type");
+            cond.value = c.getAttribute("Value");
+            local.add(cond);
         }
 
-        if (dumpDir != null) Files.createDirectories(dumpDir);
-
-        // Read and sanitize initial XML (BOM / junk before '<')
-        String current = Files.readString(inputXmlPath, StandardCharsets.UTF_8);
-        current = sanitizeXmlLikeInput(current);
-
-        if (!looksLikeXml(current) || !isWellFormedXml(current)) {
-            throw new IllegalStateException(
-                    "Input file does not look like well-formed XML after sanitization.\n" +
-                    "First 200 chars:\n" + preview(current, 200));
+        for (Element a : children(node, "ACTION")) {
+            Path p = new Path();
+            p.conditions.addAll(local);
+            p.action = a.getAttribute("Label");
+            paths.add(p);
         }
 
-        TransformerFactory tf = newSecureTransformerFactory();
-
-        List<Templates> templates = new ArrayList<>();
-        List<String> outputMethods = new ArrayList<>();
-
-        for (Path xslt : xsltFiles) {
-            StreamSource xsltSource = new StreamSource(xslt.toFile());
-            // Important for xsl:include/import relative resolution
-            xsltSource.setSystemId(xslt.toUri().toString());
-
-            templates.add(tf.newTemplates(xsltSource));
-            outputMethods.add(detectXsltOutputMethod(xslt)); // xml/html/text/unknown
+        for (Element child : children(node, "NODE")) {
+            walk(child, local);
         }
+    }
 
-        String finalText = null;
+    /* ===================== DECISION TABLE ===================== */
 
-        for (int i = 0; i < templates.size(); i++) {
-            Path xsltFile = xsltFiles.get(i);
-            String method = outputMethods.get(i);
+    static void writeDecisionTable() throws Exception {
+        try (PrintWriter pw = new PrintWriter("decision-table.csv")) {
+            Set<String> vars = paths.stream()
+                    .flatMap(p -> p.conditions.stream().map(c -> c.key))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
 
-            // Ensure we only feed XML into an XSLT transform
-            current = sanitizeXmlLikeInput(current);
-            boolean currentIsXml = looksLikeXml(current) && isWellFormedXml(current);
+            pw.println(String.join(",", vars) + ",ACTION");
 
-            if (!currentIsXml) {
-                String msg =
-                        "Step " + (i + 1) + " cannot run because the current pipeline content is NOT XML.\n" +
-                        "This usually means an earlier XSLT already output JSON/text.\n" +
-                        "Current content starts with: " + preview(firstNonWs(current), 60) + "\n" +
-                        "Next XSLT file: " + xsltFile.getFileName() + "\n";
-                if (strictXmlPipeline) throw new IllegalStateException(msg);
-            }
-
-            String transformed;
-            try {
-                transformed = transformToString(templates.get(i), current);
-            } catch (TransformerException te) {
-                // Add extra diagnostics for “Content is not allowed in prolog”
-                String head = preview(firstNonWs(current), 120);
-                throw new IllegalStateException(
-                        "XSLT transform failed at step " + (i + 1) + " using " + xsltFile.getFileName() + "\n" +
-                        "XSLT declared output method: " + method + "\n" +
-                        "Input starts with: " + head + "\n" +
-                        "If you see JSON/text here, ensure ONLY the FINAL XSLT outputs JSON/text.\n",
-                        te
-                );
-            }
-
-            if (dumpDir != null) {
-                String dumpName = String.format("%02d_%s.out", (i + 1), stripExt(xsltFile.getFileName().toString()));
-                Files.writeString(dumpDir.resolve(dumpName), transformed, StandardCharsets.UTF_8,
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            }
-
-            String transformedTrim = firstNonWs(transformed);
-            boolean producedJsonLike = transformedTrim.startsWith("{") || transformedTrim.startsWith("[");
-            boolean producedText = "text".equalsIgnoreCase(method) || producedJsonLike;
-
-            if (producedText) {
-                finalText = transformed;
-                if (i != templates.size() - 1) {
-                    throw new IllegalStateException(
-                            "Your pipeline produced JSON/text at step " + (i + 1) + " (" + xsltFile.getFileName() + "),\n" +
-                            "but there are more XSLTs after it.\n\n" +
-                            "Fix: ensure all earlier XSLTs output XML, and ONLY the last one outputs JSON/text.\n" +
-                            "Output starts with: " + preview(transformedTrim, 120) + "\n"
-                    );
+            for (Path p : paths) {
+                Map<String, List<String>> row = new HashMap<>();
+                for (Condition c : p.conditions) {
+                    row.computeIfAbsent(c.key, k -> new ArrayList<>())
+                            .add(c.op + ":" + c.value);
                 }
-            } else {
-                // Continue as XML
-                current = transformed;
+
+                for (String v : vars) {
+                    pw.print(row.containsKey(v)
+                            ? String.join("&", row.get(v))
+                            : "");
+                    pw.print(",");
+                }
+                pw.println(p.action);
             }
         }
-
-        if (finalText == null) {
-            // Pipeline ended with XML; that means your last XSLT didn't output JSON.
-            String endTrim = firstNonWs(current);
-            throw new IllegalStateException(
-                    "Pipeline completed but did not produce JSON/text output.\n" +
-                    "Last output looks like XML (starts with): " + preview(endTrim, 120) + "\n" +
-                    "Fix: make the final XSLT output JSON with <xsl:output method=\"text\" encoding=\"UTF-8\"/>"
-            );
-        }
-
-        // Validate + pretty print JSON
-        String jsonText = finalText.trim();
-        ObjectMapper mapper = new ObjectMapper();
-
-        JsonNode node;
-        try {
-            node = mapper.readTree(jsonText);
-        } catch (Exception e) {
-            throw new IllegalStateException(
-                    "Final output is not valid JSON.\n" +
-                    "First 300 chars:\n" + preview(jsonText, 300) + "\n" +
-                    "If your last XSLT outputs XML, you need an XML->JSON step or change the last XSLT.\n",
-                    e
-            );
-        }
-
-        Files.createDirectories(outputJsonPath.toAbsolutePath().getParent());
-        String pretty = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(node);
-        Files.writeString(outputJsonPath, pretty, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-
-        System.out.println("Done.");
-        System.out.println("Applied XSLTs in order:");
-        for (int i = 0; i < xsltFiles.size(); i++) {
-            System.out.println("  " + (i + 1) + ". " + xsltFiles.get(i).getFileName() + " (method=" + outputMethods.get(i) + ")");
-        }
-        if (dumpDir != null) {
-            System.out.println("Intermediate outputs dumped to: " + dumpDir.toAbsolutePath());
-        }
-        System.out.println("Output JSON: " + outputJsonPath.toAbsolutePath());
     }
 
-    // -------------------- Core helpers --------------------
+    /* ===================== SHADOWED PATHS ===================== */
 
-    private static List<Path> listXsltFiles(Path xsltDir) throws IOException {
-        if (!Files.isDirectory(xsltDir)) {
-            throw new IllegalArgumentException("Not a directory: " + xsltDir.toAbsolutePath());
-        }
-        try (var stream = Files.list(xsltDir)) {
-            return stream
-                    .filter(Files::isRegularFile)
-                    .filter(p -> {
-                        String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
-                        return n.endsWith(".xslt") || n.endsWith(".xsl");
-                    })
-                    .sorted(Comparator.comparing(p -> p.getFileName().toString().toLowerCase(Locale.ROOT)))
-                    .collect(Collectors.toList());
+    static void writeShadowed() throws Exception {
+        try (PrintWriter pw = new PrintWriter("shadowed-paths.txt")) {
+            for (int i = 0; i < paths.size(); i++) {
+                for (int j = 0; j < paths.size(); j++) {
+                    if (i == j) continue;
+                    if (subsumes(paths.get(i), paths.get(j))) {
+                        pw.println("PATH " + j + " shadowed by PATH " + i);
+                    }
+                }
+            }
         }
     }
 
-    /** Removes UTF-8 BOM and trims junk before first '<' (common cause of "Content is not allowed in prolog"). */
-    private static String sanitizeXmlLikeInput(String s) {
-        if (s == null) return null;
-        s = s.replace("\uFEFF", ""); // BOM
-        int idx = s.indexOf('<');
-        if (idx > 0) {
-            // Drop any junk before the first '<'
-            s = s.substring(idx);
-        }
-        return s;
+    static boolean subsumes(Path a, Path b) {
+        if (!a.action.equals(b.action)) return false;
+        return b.conditions.containsAll(a.conditions);
     }
 
-    private static TransformerFactory newSecureTransformerFactory() {
-        TransformerFactory tf = TransformerFactory.newInstance();
-        try { tf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) {}
-        try { tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, ""); } catch (Exception ignored) {}
-        try { tf.setAttribute(XMLConstants.ACCESS_EXTERNAL_STYLESHEET, ""); } catch (Exception ignored) {}
-        return tf;
-    }
+    /* ===================== GAP ANALYSIS ===================== */
 
-    private static String transformToString(Templates templates, String inputXml) throws TransformerException {
-        Transformer transformer = templates.newTransformer();
-        StreamSource in = new StreamSource(new StringReader(inputXml));
-        StringWriter out = new StringWriter();
-        transformer.transform(in, new StreamResult(out));
-        return out.toString();
-    }
+    static void writeGaps() throws Exception {
+        try (PrintWriter pw = new PrintWriter("gap-analysis.txt")) {
+            Map<String, List<NumericRange>> ranges = new HashMap<>();
 
-    /** Fast heuristic (doesn't guarantee validity). */
-    private static boolean looksLikeXml(String s) {
-        if (s == null) return false;
-        String t = firstNonWs(s);
-        return t.startsWith("<");
-    }
+            for (Path p : paths) {
+                for (Condition c : p.conditions) {
+                    if (!c.value.matches("-?\\d+(\\.\\d+)?")) continue;
+                    double v = Double.parseDouble(c.value);
+                    if (c.op.equals("ge")) {
+                        ranges.computeIfAbsent(c.key, k -> new ArrayList<>())
+                                .add(new NumericRange(v, Double.POSITIVE_INFINITY));
+                    }
+                    if (c.op.equals("lt")) {
+                        ranges.computeIfAbsent(c.key, k -> new ArrayList<>())
+                                .add(new NumericRange(Double.NEGATIVE_INFINITY, v));
+                    }
+                }
+            }
 
-    /** Validates XML well-formedness by parsing (securely). */
-    private static boolean isWellFormedXml(String xml) {
-        try {
-            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-            dbf.setNamespaceAware(true);
-
-            // Secure XML parsing
-            try { dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) {}
-            try { dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true); } catch (Exception ignored) {}
-            try { dbf.setFeature("http://xml.org/sax/features/external-general-entities", false); } catch (Exception ignored) {}
-            try { dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false); } catch (Exception ignored) {}
-            try { dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, ""); } catch (Exception ignored) {}
-            try { dbf.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, ""); } catch (Exception ignored) {}
-
-            var db = dbf.newDocumentBuilder();
-            db.parse(new InputSource(new StringReader(xml)));
-            return true;
-        } catch (Exception e) {
-            return false;
+            for (var e : ranges.entrySet()) {
+                pw.println("Variable: " + e.getKey());
+                List<NumericRange> rs = e.getValue();
+                rs.sort(Comparator.comparingDouble(r -> r.min));
+                for (int i = 1; i < rs.size(); i++) {
+                    if (rs.get(i - 1).max < rs.get(i).min) {
+                        pw.println("  GAP: " + rs.get(i - 1).max + " to " + rs.get(i).min);
+                    }
+                }
+            }
         }
     }
 
-    /**
-     * Attempts to detect <xsl:output method="..."> from an XSLT file.
-     * Returns: "xml", "html", "text", or "unknown"
-     */
-    private static String detectXsltOutputMethod(Path xsltFile) {
-        try {
-            String xslt = Files.readString(xsltFile, StandardCharsets.UTF_8);
-            // simple regex is enough for detection (not full parsing)
-            Pattern p = Pattern.compile("<\\s*xsl:output\\b[^>]*\\bmethod\\s*=\\s*['\"](xml|html|text)['\"][^>]*>",
-                    Pattern.CASE_INSENSITIVE);
-            Matcher m = p.matcher(xslt);
-            if (m.find()) return m.group(1).toLowerCase(Locale.ROOT);
-        } catch (Exception ignored) {}
-        return "unknown";
+    /* ===================== VISUAL HTML ===================== */
+
+    static void writeHtml() throws Exception {
+        try (PrintWriter pw = new PrintWriter("fsml-visual.html")) {
+            pw.println("""
+                <html><head>
+                <style>
+                body{font-family:Arial}
+                .rule{border:1px solid #ccc;margin:10px;padding:10px;border-radius:8px}
+                .cond{color:#333}
+                .action{background:#ffe0a3;padding:5px;border-radius:6px;display:inline-block}
+                </style></head><body>
+                <h1>FSML Decision Paths</h1>
+                """);
+
+            int i = 1;
+            for (Path p : paths) {
+                pw.println("<div class='rule'><b>Rule " + (i++) + "</b><br/>");
+                for (Condition c : p.conditions) {
+                    pw.println("<div class='cond'>" + c + "</div>");
+                }
+                pw.println("<div class='action'>" + p.action + "</div></div>");
+            }
+
+            pw.println("</body></html>");
+        }
     }
 
-    private static String firstNonWs(String s) {
-        if (s == null) return "";
-        int i = 0;
-        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
-        return s.substring(i);
-    }
+    /* ===================== MAIN ===================== */
 
-    private static String preview(String s, int max) {
-        if (s == null) return "";
-        s = s.replace("\r", "");
-        if (s.length() <= max) return s;
-        return s.substring(0, max) + " ...";
-    }
+    public static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            System.err.println("Usage: java FsmlAnalyzerAllInOne <fsml-file>");
+            return;
+        }
 
-    private static String stripExt(String name) {
-        int dot = name.lastIndexOf('.');
-        return (dot > 0) ? name.substring(0, dot) : name;
+        Document doc = DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder()
+                .parse(new File(args[0]));
+
+        Element strategy = (Element) doc.getElementsByTagName("STRATEGY").item(0);
+        Element rootNode = (Element) strategy.getElementsByTagName("NODE").item(0);
+
+        walk(rootNode, new ArrayList<>());
+
+        writeDecisionTable();
+        writeShadowed();
+        writeGaps();
+        writeHtml();
+
+        System.out.println("TOTAL PATHS: " + paths.size());
     }
 }
