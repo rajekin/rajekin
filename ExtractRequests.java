@@ -3,237 +3,222 @@ import javax.xml.parsers.*;
 import java.io.*;
 import java.util.*;
 
-public class FsmlAnalyzerAllInOne {
+public class FsmlAnalyzerMain {
 
     /* ======================= DATA MODELS ======================= */
 
-    static class Interval {
-        Double min, max;
+    static class Cond {
+        String key;   // DecisionKey
+        String type;  // ge/lt/eq/and/true/etc
+        String value; // Value
 
-        Interval(Double min, Double max) {
-            this.min = min;
-            this.max = max;
-        }
+        Cond(String k, String t, String v) { key=k; type=t; value=v; }
 
-        boolean covers(Interval o) {
-            if (o == null) return true;
-            if (min != null && o.min != null && min > o.min) return false;
-            if (max != null && o.max != null && max < o.max) return false;
-            return true;
-        }
-
-        public String toString() {
-            if (min == null && max == null) return "NAN";
-            if (min == null) return "<= " + max;
-            if (max == null) return ">= " + min;
-            return min + " - " + max;
+        @Override public String toString() {
+            String v = (value == null || value.isBlank() || "NaN".equalsIgnoreCase(value)) ? "NAN" : value;
+            return key + " " + type + " " + v;
         }
     }
 
     static class Path {
-        Map<String, Interval> numeric = new LinkedHashMap<>();
-        Map<String, String> categorical = new LinkedHashMap<>();
+        List<Cond> conds = new ArrayList<>();
         String action;
         int id;
-        boolean invalid = false;
 
         Path copy() {
             Path p = new Path();
-            p.numeric.putAll(this.numeric);
-            p.categorical.putAll(this.categorical);
+            p.conds.addAll(this.conds);
             return p;
         }
     }
 
-    static List<Path> paths = new ArrayList<>();
-    static Set<String> allAttributes = new LinkedHashSet<>();
+    static final List<Path> PATHS = new ArrayList<>();
+    static final LinkedHashSet<String> ALL_KEYS = new LinkedHashSet<>();
 
-    /* ======================= XML HELPERS ======================= */
+    /* ======================= XML HELPERS (namespace safe) ======================= */
 
-    static List<Element> children(Element e, String tag) {
+    static String localName(Node n) {
+        String ln = n.getLocalName();
+        if (ln != null) return ln;
+        String nn = n.getNodeName();
+        int i = nn.indexOf(':');
+        return i >= 0 ? nn.substring(i + 1) : nn;
+    }
+
+    static boolean isTag(Node n, String name) {
+        return n instanceof Element && name.equalsIgnoreCase(localName(n));
+    }
+
+    static List<Element> children(Element p, String name) {
         List<Element> out = new ArrayList<>();
-        NodeList nl = e.getChildNodes();
+        if (p == null) return out;
+        NodeList nl = p.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
-            if (nl.item(i) instanceof Element) {
-                Element c = (Element) nl.item(i);
-                if (c.getTagName().equals(tag)) out.add(c);
-            }
+            Node n = nl.item(i);
+            if (isTag(n, name)) out.add((Element) n);
         }
         return out;
     }
 
-    static Element firstChild(Element e, String tag) {
-        for (Element c : children(e, tag)) return c;
-        return null;
+    static Element firstChild(Element p, String name) {
+        List<Element> c = children(p, name);
+        return c.isEmpty() ? null : c.get(0);
+    }
+
+    static String attr(Element e, String a) {
+        String v = e.getAttribute(a);
+        return (v == null) ? "" : v;
     }
 
     /* ======================= CONDITION EXTRACTION ======================= */
 
-    static void extractConditions(Element c, Path p) {
+    static void addCond(Path p, String key, String type, String value) {
+        if (key == null || key.isBlank()) return;
 
-        String key = c.getAttribute("DecisionKey");
-        String type = c.getAttribute("Type");
-        String val = c.getAttribute("Value");
+        // normalize NAN handling
+        String v = value;
+        if (v == null || v.isBlank() || "NaN".equalsIgnoreCase(v)) v = "NAN";
 
-        allAttributes.add(key);
-
-        if ("and".equalsIgnoreCase(type)) {
-            for (Element sub : children(c, "CONDITION")) {
-                extractConditions(sub, p);
-            }
-            return;
-        }
-
-        if (val == null || val.isEmpty()) {
-            p.categorical.put(key, "NAN");
-            return;
-        }
-
-        if ("ge".equals(type) || "gt".equals(type) ||
-            "le".equals(type) || "lt".equals(type)) {
-
-            Double num = Double.valueOf(val);
-            Interval local;
-
-            if ("ge".equals(type)) local = new Interval(num, null);
-            else if ("gt".equals(type)) local = new Interval(num + 0.0001, null);
-            else if ("le".equals(type)) local = new Interval(null, num);
-            else local = new Interval(null, num - 0.0001);
-
-            Interval base = p.numeric.get(key);
-            if (base == null) {
-                p.numeric.put(key, local);
-            } else {
-                Double min = base.min, max = base.max;
-                if (local.min != null) min = (min == null) ? local.min : Math.max(min, local.min);
-                if (local.max != null) max = (max == null) ? local.max : Math.min(max, local.max);
-                if (min != null && max != null && min > max) {
-                    p.invalid = true;
-                    return;
-                }
-                p.numeric.put(key, new Interval(min, max));
-            }
-        } else {
-            p.categorical.put(key, val);
-        }
+        ALL_KEYS.add(key);
+        p.conds.add(new Cond(key, type == null ? "" : type, v));
     }
 
-    /* ======================= TREE WALK ======================= */
+    // FSML can have <CONDITION Type="and"> with nested <CONDITION.../>
+    static void extractConditionRecursive(Element condEl, Path p) {
+        String type = attr(condEl, "Type");
 
-    static void walk(Element node, Path incoming) {
+        // Container node: AND block
+        if ("and".equalsIgnoreCase(type)) {
+            for (Element sub : children(condEl, "CONDITION")) {
+                extractConditionRecursive(sub, p);
+            }
+            return;
+        }
+
+        // Type="true" is the root placeholder, ignore
+        if ("true".equalsIgnoreCase(type)) return;
+
+        String key = attr(condEl, "DecisionKey");
+        String val = attr(condEl, "Value");
+
+        addCond(p, key, type, val);
+    }
+
+    /* ======================= TREE WALK (AND accumulation across NODEs) ======================= */
+
+    static void walkNode(Element node, Path incoming) {
+        if (node == null) return;
 
         Path cur = incoming.copy();
 
-        // AND conditions at this node
+        // All conditions at this NODE are ANDed
         for (Element c : children(node, "CONDITION")) {
-            extractConditions(c, cur);
-            if (cur.invalid) return;
+            extractConditionRecursive(c, cur);
         }
 
+        // ACTIONS is the leaf action element in your FSML
         Element act = firstChild(node, "ACTIONS");
         List<Element> kids = children(node, "NODE");
 
-        if (act != null && kids.isEmpty()) {
-            cur.action = act.getAttribute("Label");
-            cur.id = paths.size() + 1;
-            paths.add(cur);
-            return;
+        // If this node has an action, record a path (even if formatting includes whitespace)
+        if (act != null) {
+            Path leaf = cur.copy();
+            leaf.action = attr(act, "Label");
+            leaf.id = PATHS.size() + 1;
+            PATHS.add(leaf);
+            // Note: FSML often uses action as leaf; if it ALSO has kids, keep walking too
         }
 
         for (Element k : kids) {
-            walk(k, cur);
+            walkNode(k, cur);
         }
     }
 
-    /* ======================= SHADOW DETECTION ======================= */
+    /* ======================= OUTPUT (simple + correct) ======================= */
 
-    static boolean shadows(Path a, Path b) {
-        if (!Objects.equals(a.action, b.action)) return false;
+    static void writeDecisionTableCsv(String file) throws Exception {
+        try (PrintWriter out = new PrintWriter(file)) {
+            out.print("PATH_ID");
+            for (String k : ALL_KEYS) out.print("," + k);
+            out.println(",ACTION");
 
-        for (String k : allAttributes) {
-            Interval ai = a.numeric.get(k);
-            Interval bi = b.numeric.get(k);
-            if (ai != null && !ai.covers(bi)) return false;
-
-            String ac = a.categorical.get(k);
-            String bc = b.categorical.get(k);
-            if (ac != null && bc != null && !ac.equals(bc)) return false;
-        }
-        return true;
-    }
-
-    /* ======================= OUTPUT ======================= */
-
-    static void writeCSV() throws Exception {
-        PrintWriter out = new PrintWriter("decision_table.csv");
-        out.print("ID");
-        for (String a : allAttributes) out.print("," + a);
-        out.println(",Action");
-
-        for (Path p : paths) {
-            out.print(p.id);
-            for (String a : allAttributes) {
-                if (p.numeric.containsKey(a)) out.print("," + p.numeric.get(a));
-                else if (p.categorical.containsKey(a)) out.print("," + p.categorical.get(a));
-                else out.print(",NAN");
-            }
-            out.println("," + p.action);
-        }
-        out.close();
-    }
-
-    static void writeHTML() throws Exception {
-        PrintWriter out = new PrintWriter("decision_table.html");
-        out.println("<html><head><style>");
-        out.println("table{border-collapse:collapse;font-family:Arial}");
-        out.println("th,td{border:1px solid #444;padding:6px}");
-        out.println("th{background:#222;color:white}");
-        out.println("</style></head><body>");
-        out.println("<h2>FSML Decision Table</h2>");
-        out.println("<table><tr><th>ID</th>");
-        for (String a : allAttributes) out.println("<th>" + a + "</th>");
-        out.println("<th>Action</th></tr>");
-
-        for (Path p : paths) {
-            out.println("<tr><td>" + p.id + "</td>");
-            for (String a : allAttributes) {
-                if (p.numeric.containsKey(a)) out.println("<td>" + p.numeric.get(a) + "</td>");
-                else if (p.categorical.containsKey(a)) out.println("<td>" + p.categorical.get(a) + "</td>");
-                else out.println("<td>NAN</td>");
-            }
-            out.println("<td>" + p.action + "</td></tr>");
-        }
-        out.println("</table></body></html>");
-        out.close();
-    }
-
-    static void writeShadowAnalysis() throws Exception {
-        PrintWriter out = new PrintWriter("shadowed_paths.txt");
-        for (int i = 0; i < paths.size(); i++) {
-            for (int j = 0; j < paths.size(); j++) {
-                if (i != j && shadows(paths.get(i), paths.get(j))) {
-                    out.println("Path " + paths.get(j).id +
-                            " is shadowed by Path " + paths.get(i).id);
+            for (Path p : PATHS) {
+                Map<String, List<String>> m = new LinkedHashMap<>();
+                for (Cond c : p.conds) {
+                    m.computeIfAbsent(c.key, kk -> new ArrayList<>()).add(c.type + ":" + c.value);
                 }
+
+                out.print(p.id);
+                for (String k : ALL_KEYS) {
+                    List<String> vals = m.get(k);
+                    out.print(",");
+                    if (vals == null || vals.isEmpty()) out.print("NAN");
+                    else out.print(String.join("&", vals));
+                }
+                out.println("," + (p.action == null ? "NAN" : p.action));
             }
         }
-        out.close();
+    }
+
+    static void writeHtml(String file) throws Exception {
+        try (PrintWriter out = new PrintWriter(file)) {
+            out.println("<html><head><meta charset='UTF-8'><style>");
+            out.println("body{font-family:Arial;background:#f4f6f8;margin:20px}");
+            out.println(".card{background:#fff;border-radius:10px;padding:12px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.12);max-width:1000px}");
+            out.println(".t{font-weight:700;color:#2c3e50;margin-bottom:8px}");
+            out.println(".c{margin-left:18px;color:#34495e}");
+            out.println(".a{margin-top:10px;font-weight:700;color:#c0392b;background:#fff3cd;padding:6px 10px;border-radius:8px;display:inline-block}");
+            out.println("</style></head><body>");
+            out.println("<h1>FSML Rules Extract</h1>");
+            out.println("<div>Total Paths: " + PATHS.size() + "</div>");
+
+            for (Path p : PATHS) {
+                out.println("<div class='card'>");
+                out.println("<div class='t'>Rule " + p.id + "</div>");
+                for (Cond c : p.conds) out.println("<div class='c'>➜ " + esc(c.toString()) + "</div>");
+                out.println("<div class='a'>ACTION → " + esc(p.action == null ? "NAN" : p.action) + "</div>");
+                out.println("</div>");
+            }
+
+            out.println("</body></html>");
+        }
+    }
+
+    static String esc(String s) {
+        if (s == null) return "";
+        return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
     }
 
     /* ======================= MAIN ======================= */
 
     public static void main(String[] args) throws Exception {
+        String fsml = (args.length > 0) ? args[0] : "PenFed_AR_Expert_09042025.fsml";
 
-        DocumentBuilder db = DocumentBuilderFactory.newInstance().newDocumentBuilder();
-        Document doc = db.parse(new File("fsml.xml"));
+        DocumentBuilderFactory f = DocumentBuilderFactory.newInstance();
+        f.setNamespaceAware(true); // important for FSML variants
+        Document doc = f.newDocumentBuilder().parse(new File(fsml));
 
-        Element root = doc.getDocumentElement();
-        walk(root, new Path());
+        // Find STRATEGY (namespace-safe)
+        Element strategy = null;
+        NodeList all = doc.getElementsByTagName("*");
+        for (int i = 0; i < all.getLength(); i++) {
+            Node n = all.item(i);
+            if (isTag(n, "STRATEGY")) { strategy = (Element) n; break; }
+        }
+        if (strategy == null) throw new IllegalStateException("No <STRATEGY> found in FSML.");
 
-        writeCSV();
-        writeHTML();
-        writeShadowAnalysis();
+        // Find root NODE under STRATEGY
+        Element rootNode = firstChild(strategy, "NODE");
+        if (rootNode == null) throw new IllegalStateException("No <NODE> found under <STRATEGY>.");
 
-        System.out.println("Paths generated: " + paths.size());
+        walkNode(rootNode, new Path());
+
+        // Write outputs
+        writeDecisionTableCsv("decision-table.csv");
+        writeHtml("fsml-view.html");
+
+        System.out.println("FSML File: " + fsml);
+        System.out.println("TOTAL PATHS: " + PATHS.size());
+        System.out.println("Generated: decision-table.csv, fsml-view.html");
     }
 }
