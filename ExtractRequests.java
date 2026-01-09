@@ -5,15 +5,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * FSML Analyzer (single file, Java 21)
- *
- * Outputs:
- *  - decision-table.csv  (Excel-ready)
- *  - fsml-view.html      (beautiful readable rules)
- *  - gap-analysis.txt    (numeric gaps per variable)
- *  - shadowed-paths.txt  (shadow/subsumption detection)
- */
 public class FsmlAnalyzerMain {
 
     /* ======================= MODELS ======================= */
@@ -43,8 +34,9 @@ public class FsmlAnalyzerMain {
 
             Double nMin = this.min;
             boolean nMinInc = this.minInc;
+
             if (o.min != null) {
-                if (nMin == null || o.min > nMin || (Objects.equals(o.min, nMin) && !o.minInc && nMinInc)) {
+                if (nMin == null || o.min > nMin) {
                     nMin = o.min;
                     nMinInc = o.minInc;
                 } else if (Objects.equals(o.min, nMin)) {
@@ -54,8 +46,9 @@ public class FsmlAnalyzerMain {
 
             Double nMax = this.max;
             boolean nMaxInc = this.maxInc;
+
             if (o.max != null) {
-                if (nMax == null || o.max < nMax || (Objects.equals(o.max, nMax) && !o.maxInc && nMaxInc)) {
+                if (nMax == null || o.max < nMax) {
                     nMax = o.max;
                     nMaxInc = o.maxInc;
                 } else if (Objects.equals(o.max, nMax)) {
@@ -63,7 +56,7 @@ public class FsmlAnalyzerMain {
                 }
             }
 
-            // Check emptiness
+            // empty check
             if (nMin != null && nMax != null) {
                 if (nMin > nMax) return null;
                 if (Objects.equals(nMin, nMax) && !(nMinInc && nMaxInc)) return null;
@@ -74,69 +67,57 @@ public class FsmlAnalyzerMain {
 
         boolean covers(Interval o) {
             if (o == null) return true;
-            // min check: this.min <= o.min
-            if (this.min != null && o.min != null) {
-                if (this.min > o.min) return false;
-                if (Objects.equals(this.min, o.min) && this.minInc == false && o.minInc == true) return false;
-            } else if (this.min != null && o.min == null) {
-                return false;
+
+            // min: this <= o
+            if (this.min != null) {
+                if (o.min == null) return false;
+                int c = Double.compare(this.min, o.min);
+                if (c > 0) return false;
+                if (c == 0 && !this.minInc && o.minInc) return false;
             }
 
-            // max check: this.max >= o.max
-            if (this.max != null && o.max != null) {
-                if (this.max < o.max) return false;
-                if (Objects.equals(this.max, o.max) && this.maxInc == false && o.maxInc == true) return false;
-            } else if (this.max != null && o.max == null) {
-                return false;
+            // max: this >= o
+            if (this.max != null) {
+                if (o.max == null) return false;
+                int c = Double.compare(this.max, o.max);
+                if (c < 0) return false;
+                if (c == 0 && !this.maxInc && o.maxInc) return false;
             }
 
             return true;
         }
 
         String asMath(String var) {
-            // Render as range, best-effort
-            if (min == null && max == null) return "NAN";
+            if (min == null && max == null) return var + " = NAN";
+
             if (min != null && max != null && Objects.equals(min, max) && minInc && maxInc) {
                 return var + " = " + fmt(min);
             }
+
             if (min == null) return var + " " + (maxInc ? "≤" : "<") + " " + fmt(max);
             if (max == null) return var + " " + (minInc ? "≥" : ">") + " " + fmt(min);
 
-            return fmt(min) + " " + (minInc ? "≤" : "<") + " " + var + " " + (maxInc ? "≤" : "<") + " " + fmt(max);
+            String left = fmt(min) + " " + (minInc ? "≤" : "<") + " " + var;
+            String right = var + " " + (maxInc ? "≤" : "<") + " " + fmt(max);
+            return left + " AND " + right;
         }
-
-        @Override public String toString() {
-            return asMath("x");
-        }
-    }
-
-    static class Condition {
-        String key;
-        String op;     // ge/lt/eq/etc
-        String value;  // resolved LOW/HIGH->numbers, NaN->NAN
-        Condition(String k, String o, String v) { key=k; op=o; value=v; }
     }
 
     static class Path {
         int id;
         String action;
 
-        // For decision-table and analysis:
-        // numeric constraints expressed as final interval per variable
         Map<String, Interval> numeric = new LinkedHashMap<>();
-        // categorical constraints as list of "op:value" clauses (kept verbatim)
         Map<String, List<String>> categorical = new LinkedHashMap<>();
-
-        // keep raw conditions for debugging/HTML
-        List<Condition> raw = new ArrayList<>();
 
         boolean invalid;
 
         Path copy() {
             Path p = new Path();
             p.numeric.putAll(this.numeric);
-            for (var e : this.categorical.entrySet()) p.categorical.put(e.getKey(), new ArrayList<>(e.getValue()));
-            p.raw.addAll(this.raw);
+            for (var e : this.categorical.entrySet()) {
+                p.categorical.put(e.getKey(), new ArrayList<>(e.getValue()));
+            }
             return p;
         }
     }
@@ -183,10 +164,9 @@ public class FsmlAnalyzerMain {
         return v == null ? "" : v;
     }
 
-    /* ======================= PARSE VARIABLES (bounds + order) ======================= */
+    /* ======================= PARSE VARIABLE ORDER + BOUNDS ======================= */
 
     static void parseVariableOrder(Document doc) {
-        // VARIABLE-ORDER is inside STRATEGY in your FSML
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
             Node n = all.item(i);
@@ -205,7 +185,6 @@ public class FsmlAnalyzerMain {
     }
 
     static void parseNumericBounds(Document doc) {
-        // Find all NumericKey nodes and their NumericRange minValue/maxValue
         NodeList all = doc.getElementsByTagName("*");
         for (int i = 0; i < all.getLength(); i++) {
             Node n = all.item(i);
@@ -216,23 +195,21 @@ public class FsmlAnalyzerMain {
             if (shortName.isBlank()) shortName = attr(nk, "LongName");
             if (shortName.isBlank()) continue;
 
-            Element nr = null;
-            for (Element c : children(nk, "NumericRange")) { nr = c; break; }
+            Element nr = firstChild(nk, "NumericRange");
             if (nr == null) continue;
 
             String minV = attr(nr, "minValue");
             String maxV = attr(nr, "maxValue");
-            try {
-                double min = Double.parseDouble(minV);
-                double max = Double.parseDouble(maxV);
+
+            Double min = safeParseDouble(minV);
+            Double max = safeParseDouble(maxV);
+            if (min != null && max != null) {
                 NUM_BOUNDS.put(shortName, new Bounds(min, max));
-            } catch (Exception ignored) {
-                // leave unbounded if cannot parse
             }
         }
     }
 
-    /* ======================= VALUE RESOLUTION ======================= */
+    /* ======================= VALUE HANDLING (LOW/HIGH/NAN) ======================= */
 
     static boolean isNanToken(String v) {
         return v == null || v.isBlank() || "NaN".equalsIgnoreCase(v) || "NAN".equalsIgnoreCase(v);
@@ -240,6 +217,7 @@ public class FsmlAnalyzerMain {
 
     static String resolveValue(String key, String rawVal) {
         if (isNanToken(rawVal)) return "NAN";
+
         if ("LOW".equalsIgnoreCase(rawVal)) {
             Bounds b = NUM_BOUNDS.get(key);
             return b == null ? "LOW" : fmt(b.min);
@@ -256,16 +234,24 @@ public class FsmlAnalyzerMain {
         return s.matches("[-+]?\\d+(\\.\\d+)?");
     }
 
+    static Double safeParseDouble(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.isEmpty() || "NaN".equalsIgnoreCase(t)) return null;
+        try { return Double.parseDouble(t); } catch (Exception e) { return null; }
+    }
+
     static String opSymbol(String op) {
-        return switch (op) {
-            case "lt" -> "<";
-            case "le" -> "≤";
-            case "gt" -> ">";
-            case "ge" -> "≥";
-            case "eq" -> "=";
-            case "ne" -> "≠";
-            default -> op;
-        };
+        if (op == null) return "";
+        switch (op) {
+            case "lt": return "<";
+            case "le": return "≤";
+            case "gt": return ">";
+            case "ge": return "≥";
+            case "eq": return "=";
+            case "ne": return "≠";
+            default: return op;
+        }
     }
 
     /* ======================= CONDITION EXTRACTION ======================= */
@@ -278,29 +264,30 @@ public class FsmlAnalyzerMain {
     static void addNumeric(Path p, String key, Interval local) {
         ALL_KEYS.add(key);
         Interval base = p.numeric.get(key);
+
         if (base == null) {
-            p.numeric.put(key, local);
-        } else {
-            Interval merged = base.intersect(local);
-            if (merged == null) {
-                p.invalid = true;
-            } else {
-                p.numeric.put(key, merged);
-            }
+            // start from universe if we have bounds, else use local directly
+            Bounds b = NUM_BOUNDS.get(key);
+            if (b != null) base = Interval.universe(b);
+            else base = new Interval(null, true, null, true);
         }
+
+        Interval merged = base.intersect(local);
+        if (merged == null) {
+            p.invalid = true;
+            return;
+        }
+        p.numeric.put(key, merged);
     }
 
-    // FSML supports nested <CONDITION Type="and"> containing sub CONDITIONS
+    // Nested conditions: <CONDITION Type="and"> contains <CONDITION .../>
     static void extractConditionRecursive(Element condEl, Path p) {
         String type = attr(condEl, "Type");
 
-        // container AND
         if ("and".equalsIgnoreCase(type)) {
             for (Element sub : children(condEl, "CONDITION")) extractConditionRecursive(sub, p);
             return;
         }
-
-        // ignore root true placeholder
         if ("true".equalsIgnoreCase(type)) return;
 
         String key = attr(condEl, "DecisionKey");
@@ -309,51 +296,45 @@ public class FsmlAnalyzerMain {
 
         String val = resolveValue(key, rawVal);
 
-        p.raw.add(new Condition(key, type, val));
-
-        // NaN/Missing: keep literal NAN as categorical equality so it doesn’t break parsing
+        // NAN never parsed numerically — just keep as categorical so analysis doesn't fail
         if ("NAN".equalsIgnoreCase(val)) {
             addCategorical(p, key, "eq", "NAN");
             return;
         }
 
-        // numeric op?
-        boolean numericVal = looksNumeric(val);
-        if (numericVal && (type.equals("ge") || type.equals("gt") || type.equals("le") || type.equals("lt") || type.equals("eq"))) {
-            double num = Double.parseDouble(val);
+        // Numeric constraint?
+        if (looksNumeric(val) && (type.equals("ge") || type.equals("gt") || type.equals("le") || type.equals("lt") || type.equals("eq"))) {
+            Double num = safeParseDouble(val);
+            if (num == null) {
+                // fallback categorical, never throw
+                addCategorical(p, key, type, val);
+                return;
+            }
+
             Interval local;
-
             switch (type) {
-                case "ge" -> local = new Interval(num, true, null, true);
-                case "gt" -> local = new Interval(num, false, null, true);
-                case "le" -> local = new Interval(null, true, num, true);
-                case "lt" -> local = new Interval(null, true, num, false);
-                case "eq" -> local = new Interval(num, true, num, true);
-                default -> { addCategorical(p, key, type, val); return; }
+                case "ge": local = new Interval(num, true, null, true); break;
+                case "gt": local = new Interval(num, false, null, true); break;
+                case "le": local = new Interval(null, true, num, true); break;
+                case "lt": local = new Interval(null, true, num, false); break;
+                case "eq": local = new Interval(num, true, num, true); break;
+                default:   local = null;
             }
-
-            // If we know bounds, start from universe to allow proper intersection semantics later (optional)
-            if (!p.numeric.containsKey(key)) {
-                Bounds b = NUM_BOUNDS.get(key);
-                if (b != null) p.numeric.put(key, Interval.universe(b));
-            }
-
-            addNumeric(p, key, local);
+            if (local != null) addNumeric(p, key, local);
             return;
         }
 
-        // categorical
+        // Otherwise categorical
         addCategorical(p, key, type, val);
     }
 
-    /* ======================= TREE WALK (AND accumulation across NODE levels) ======================= */
+    /* ======================= TREE WALK ======================= */
 
     static void walkNode(Element node, Path incoming) {
         if (node == null) return;
 
         Path cur = incoming.copy();
 
-        // All CONDITIONS directly under this NODE are ANDed
         for (Element c : children(node, "CONDITION")) {
             extractConditionRecursive(c, cur);
             if (cur.invalid) return;
@@ -362,6 +343,7 @@ public class FsmlAnalyzerMain {
         Element act = firstChild(node, "ACTIONS");
         List<Element> kids = children(node, "NODE");
 
+        // record a rule whenever ACTIONS exists
         if (act != null) {
             Path leaf = cur.copy();
             leaf.action = attr(act, "Label");
@@ -369,42 +351,47 @@ public class FsmlAnalyzerMain {
             PATHS.add(leaf);
         }
 
-        for (Element k : kids) {
-            walkNode(k, cur);
-        }
+        for (Element k : kids) walkNode(k, cur);
     }
 
-    /* ======================= PRETTY CONDITION RENDERING (merged ranges) ======================= */
+    /* ======================= RENDER CONDITIONS (merged ranges) ======================= */
+
+    static List<String> orderedVarsForOutput() {
+        if (!VARIABLE_ORDER.isEmpty()) {
+            List<String> out = new ArrayList<>();
+            for (String v : VARIABLE_ORDER) if (ALL_KEYS.contains(v) || NUM_BOUNDS.containsKey(v)) out.add(v);
+            for (String v : ALL_KEYS) if (!out.contains(v)) out.add(v);
+            return out;
+        }
+        return new ArrayList<>(ALL_KEYS);
+    }
 
     static List<String> renderConditions(Path p) {
         List<String> lines = new ArrayList<>();
 
-        // numeric as range
+        // numeric intervals
         for (var e : p.numeric.entrySet()) {
             String k = e.getKey();
             Interval in = e.getValue();
             if (in == null) continue;
 
-            // If numeric constraint remained as pure universe and there is no other restriction, skip printing it
+            // suppress printing universe-only constraints
             Bounds b = NUM_BOUNDS.get(k);
             if (b != null) {
                 Interval u = Interval.universe(b);
-                if (u.covers(in) && in.covers(u)) {
-                    // exactly universe
-                    continue;
-                }
+                if (u.covers(in) && in.covers(u)) continue;
             }
             lines.add(in.asMath(k));
         }
 
-        // categorical as explicit clauses
+        // categorical
         for (var e : p.categorical.entrySet()) {
             String k = e.getKey();
             List<String> clauses = e.getValue();
             if (clauses == null || clauses.isEmpty()) continue;
-            // Join multiple clauses with AND
-            String joined = clauses.stream().map(c -> {
-                String[] parts = c.split(":", 2);
+
+            String joined = clauses.stream().map(cl -> {
+                String[] parts = cl.split(":", 2);
                 String op = parts[0];
                 String v = parts.length > 1 ? parts[1] : "";
                 return k + " " + opSymbol(op) + " " + v;
@@ -412,217 +399,16 @@ public class FsmlAnalyzerMain {
             lines.add(joined);
         }
 
-        // keep stable ordering based on VARIABLE-ORDER when possible
-        if (!VARIABLE_ORDER.isEmpty()) {
-            Map<String, Integer> idx = new HashMap<>();
-            for (int i = 0; i < VARIABLE_ORDER.size(); i++) idx.put(VARIABLE_ORDER.get(i), i);
+        // stable sort by VARIABLE_ORDER
+        List<String> order = orderedVarsForOutput();
+        Map<String, Integer> idx = new HashMap<>();
+        for (int i = 0; i < order.size(); i++) idx.put(order.get(i), i);
 
-            lines.sort(Comparator.comparingInt(s -> {
-                // try to match variable at start
-                String var = s.split("\\s+", 2)[0];
-                return idx.getOrDefault(var, Integer.MAX_VALUE);
-            }));
-        } else {
-            Collections.sort(lines);
-        }
-
+        lines.sort(Comparator.comparingInt(s -> idx.getOrDefault(s.split("\\s+",2)[0], Integer.MAX_VALUE)));
         return lines;
     }
 
-    /* ======================= SHADOWED PATHS ======================= */
-
-    static boolean subsumes(Path broader, Path narrower) {
-        if (!Objects.equals(broader.action, narrower.action)) return false;
-
-        // numeric: broader must cover narrower for every var it constrains
-        for (var e : broader.numeric.entrySet()) {
-            Interval b = e.getValue();
-            Interval n = narrower.numeric.get(e.getKey());
-            if (n == null) {
-                // narrower didn't constrain but broader did -> broader cannot cover all of narrower's space unless it's universe
-                Bounds bb = NUM_BOUNDS.get(e.getKey());
-                if (bb == null) return false;
-                Interval u = Interval.universe(bb);
-                if (!u.covers(b) || !b.covers(u)) return false; // not universe
-            } else {
-                if (!b.covers(n)) return false;
-            }
-        }
-
-        // categorical: broader clauses must be subset-compatible with narrower
-        // We’ll use simple containment: all broader clauses must exist in narrower
-        for (var e : broader.categorical.entrySet()) {
-            List<String> bClauses = e.getValue();
-            List<String> nClauses = narrower.categorical.get(e.getKey());
-            if (bClauses == null || bClauses.isEmpty()) continue;
-            if (nClauses == null) return false;
-            for (String bc : bClauses) if (!nClauses.contains(bc)) return false;
-        }
-
-        return true;
-    }
-
-    static void writeShadowed(String file) throws Exception {
-        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
-            // Use extraction order as priority: earlier rules shadow later rules
-            int count = 0;
-            for (int i = 0; i < PATHS.size(); i++) {
-                Path a = PATHS.get(i);
-                for (int j = i + 1; j < PATHS.size(); j++) {
-                    Path b = PATHS.get(j);
-                    if (subsumes(a, b)) {
-                        count++;
-                        out.println("Rule " + b.id + " is SHADOWED by Rule " + a.id + " (same action: " + a.action + ")");
-                        out.println("  Shadowing Rule " + a.id + " conditions:");
-                        for (String s : renderConditions(a)) out.println("    - " + s);
-                        out.println("  Shadowed Rule " + b.id + " conditions:");
-                        for (String s : renderConditions(b)) out.println("    - " + s);
-                        out.println();
-                    }
-                }
-            }
-            out.println("TOTAL SHADOWED RELATIONSHIPS: " + count);
-        }
-    }
-
-    /* ======================= GAP ANALYSIS (per variable projection) ======================= */
-
-    static List<Interval> normalizeUnion(List<Interval> intervals) {
-        List<Interval> list = intervals.stream().filter(Objects::nonNull).collect(Collectors.toList());
-        list.sort((a, b) -> {
-            if (a.min == null && b.min == null) return 0;
-            if (a.min == null) return -1;
-            if (b.min == null) return 1;
-            int c = Double.compare(a.min, b.min);
-            if (c != 0) return c;
-            // inclusive comes first
-            return Boolean.compare(!a.minInc, !b.minInc);
-        });
-
-        List<Interval> merged = new ArrayList<>();
-        for (Interval cur : list) {
-            if (merged.isEmpty()) { merged.add(cur); continue; }
-            Interval last = merged.get(merged.size() - 1);
-
-            // Check overlap/touch
-            boolean overlaps;
-            if (last.max == null || cur.min == null) overlaps = true;
-            else {
-                int cmp = Double.compare(cur.min, last.max);
-                if (cmp < 0) overlaps = true;
-                else if (cmp > 0) overlaps = false;
-                else {
-                    // equal boundary: overlaps if either is inclusive at the join
-                    overlaps = last.maxInc || cur.minInc;
-                }
-            }
-
-            if (!overlaps) {
-                merged.add(cur);
-            } else {
-                // extend last.max if needed
-                if (last.max == null || cur.max == null) {
-                    last.max = null; last.maxInc = true;
-                } else {
-                    int cmp = Double.compare(cur.max, last.max);
-                    if (cmp > 0) { last.max = cur.max; last.maxInc = cur.maxInc; }
-                    else if (cmp == 0) { last.maxInc = last.maxInc || cur.maxInc; }
-                }
-            }
-        }
-        return merged;
-    }
-
-    static void writeGaps(String file) throws Exception {
-        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
-            for (String var : orderedVarsForOutput()) {
-                Bounds b = NUM_BOUNDS.get(var);
-                if (b == null) continue; // no universe => skip
-
-                Interval universe = Interval.universe(b);
-
-                // Project all paths onto this variable:
-                // If a path doesn’t constrain var, treat it as universe (contributes full coverage).
-                List<Interval> projected = new ArrayList<>();
-                for (Path p : PATHS) {
-                    Interval in = p.numeric.get(var);
-                    if (in == null) in = universe;
-                    projected.add(in);
-                }
-
-                List<Interval> covered = normalizeUnion(projected);
-
-                // Now compute gaps inside universe
-                List<Interval> gaps = new ArrayList<>();
-                Interval cursor = new Interval(universe.min, universe.minInc, universe.min, universe.minInc); // point cursor at start
-                Double curStart = universe.min;
-                boolean curStartInc = universe.minInc;
-
-                for (Interval cov : covered) {
-                    // clip cov to universe
-                    Interval c = cov.intersect(universe);
-                    if (c == null) continue;
-
-                    // gap from curStart to c.min ?
-                    if (c.min != null && curStart != null) {
-                        int cmp = Double.compare(curStart, c.min);
-                        boolean hasGap;
-                        if (cmp < 0) hasGap = true;
-                        else if (cmp > 0) hasGap = false;
-                        else {
-                            // same point: gap exists if current start is exclusive and cov starts exclusive? (no interval)
-                            hasGap = false;
-                        }
-
-                        if (hasGap) {
-                            gaps.add(new Interval(curStart, curStartInc, c.min, !c.minInc));
-                        }
-                    }
-
-                    // advance curStart to end of c
-                    if (c.max == null) {
-                        curStart = null;
-                        curStartInc = true;
-                        break;
-                    } else {
-                        curStart = c.max;
-                        curStartInc = !c.maxInc ? false : true;
-                    }
-                }
-
-                // tail gap to universe end
-                if (curStart != null) {
-                    gaps.add(new Interval(curStart, curStartInc, universe.max, universe.maxInc));
-                }
-
-                // remove empty gaps
-                gaps = gaps.stream().filter(g -> g.intersect(universe) != null).collect(Collectors.toList());
-
-                out.println("Variable: " + var + "  Universe: " + universe.asMath(var));
-                if (gaps.isEmpty()) {
-                    out.println("  GAPS: none (based on per-variable projection across all paths)");
-                } else {
-                    out.println("  GAPS:");
-                    for (Interval g : gaps) out.println("    - " + g.asMath(var));
-                }
-                out.println();
-            }
-        }
-    }
-
-    /* ======================= DECISION TABLE OUTPUT ======================= */
-
-    static List<String> orderedVarsForOutput() {
-        if (!VARIABLE_ORDER.isEmpty()) {
-            // include only keys we saw, but keep order stable
-            List<String> out = new ArrayList<>();
-            for (String v : VARIABLE_ORDER) if (ALL_KEYS.contains(v) || NUM_BOUNDS.containsKey(v)) out.add(v);
-            // add any extras at end
-            for (String v : ALL_KEYS) if (!out.contains(v)) out.add(v);
-            return out;
-        }
-        return new ArrayList<>(ALL_KEYS);
-    }
+    /* ======================= DECISION TABLE CSV ======================= */
 
     static void writeDecisionCsv(String file) throws Exception {
         List<String> cols = orderedVarsForOutput();
@@ -633,14 +419,11 @@ public class FsmlAnalyzerMain {
 
             for (Path p : PATHS) {
                 out.print(p.id);
-
                 for (String v : cols) {
                     String cell;
-
                     if (p.numeric.containsKey(v)) {
                         cell = p.numeric.get(v).asMath(v);
                     } else if (p.categorical.containsKey(v)) {
-                        // join categorical clauses
                         cell = p.categorical.get(v).stream().map(cl -> {
                             String[] parts = cl.split(":", 2);
                             String op = parts[0];
@@ -650,10 +433,8 @@ public class FsmlAnalyzerMain {
                     } else {
                         cell = "NAN";
                     }
-
                     out.print("," + csvEscape(cell));
                 }
-
                 out.println("," + csvEscape(p.action == null ? "NAN" : p.action));
             }
         }
@@ -666,7 +447,7 @@ public class FsmlAnalyzerMain {
         return x;
     }
 
-    /* ======================= BEAUTIFUL HTML ======================= */
+    /* ======================= HTML OUTPUT ======================= */
 
     static void writeHtml(String file) throws Exception {
         try (PrintWriter out = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
@@ -713,6 +494,143 @@ public class FsmlAnalyzerMain {
         return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
     }
 
+    /* ======================= GAP ANALYSIS (per-variable projection) ======================= */
+
+    static List<Interval> normalizeUnion(List<Interval> intervals) {
+        List<Interval> list = intervals.stream().filter(Objects::nonNull).collect(Collectors.toList());
+        list.sort((a, b) -> {
+            if (a.min == null && b.min == null) return 0;
+            if (a.min == null) return -1;
+            if (b.min == null) return 1;
+            int c = Double.compare(a.min, b.min);
+            if (c != 0) return c;
+            return Boolean.compare(!a.minInc, !b.minInc);
+        });
+
+        List<Interval> merged = new ArrayList<>();
+        for (Interval cur : list) {
+            if (merged.isEmpty()) { merged.add(cur); continue; }
+            Interval last = merged.get(merged.size() - 1);
+
+            boolean overlaps;
+            if (last.max == null || cur.min == null) overlaps = true;
+            else {
+                int cmp = Double.compare(cur.min, last.max);
+                if (cmp < 0) overlaps = true;
+                else if (cmp > 0) overlaps = false;
+                else overlaps = last.maxInc || cur.minInc;
+            }
+
+            if (!overlaps) merged.add(cur);
+            else {
+                if (last.max == null || cur.max == null) { last.max = null; last.maxInc = true; }
+                else {
+                    int cmp = Double.compare(cur.max, last.max);
+                    if (cmp > 0) { last.max = cur.max; last.maxInc = cur.maxInc; }
+                    else if (cmp == 0) last.maxInc = last.maxInc || cur.maxInc;
+                }
+            }
+        }
+        return merged;
+    }
+
+    static void writeGaps(String file) throws Exception {
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+            for (String var : orderedVarsForOutput()) {
+                Bounds b = NUM_BOUNDS.get(var);
+                if (b == null) continue; // no bounds => cannot compute universe gaps
+
+                Interval universe = Interval.universe(b);
+
+                List<Interval> projected = new ArrayList<>();
+                for (Path p : PATHS) {
+                    Interval in = p.numeric.get(var);
+                    if (in == null) in = universe; // unconstrained => covers universe
+                    projected.add(in);
+                }
+
+                List<Interval> covered = normalizeUnion(projected);
+
+                List<Interval> gaps = new ArrayList<>();
+                Double cur = universe.min;
+                boolean curInc = universe.minInc;
+
+                for (Interval cov : covered) {
+                    Interval c = cov.intersect(universe);
+                    if (c == null) continue;
+
+                    if (c.min != null && cur != null) {
+                        int cmp = Double.compare(cur, c.min);
+                        if (cmp < 0) gaps.add(new Interval(cur, curInc, c.min, !c.minInc));
+                    }
+
+                    if (c.max == null) { cur = null; break; }
+                    cur = c.max;
+                    curInc = c.maxInc;
+                }
+
+                if (cur != null) gaps.add(new Interval(cur, curInc, universe.max, universe.maxInc));
+                gaps = gaps.stream().filter(g -> g.intersect(universe) != null).collect(Collectors.toList());
+
+                out.println("Variable: " + var + "  Universe: " + universe.asMath(var));
+                if (gaps.isEmpty()) out.println("  GAPS: none (per-variable projection)");
+                else {
+                    out.println("  GAPS:");
+                    for (Interval g : gaps) out.println("    - " + g.asMath(var));
+                }
+                out.println();
+            }
+        }
+    }
+
+    /* ======================= SHADOWED PATHS ======================= */
+
+    static boolean subsumes(Path broader, Path narrower) {
+        if (!Objects.equals(broader.action, narrower.action)) return false;
+
+        // numeric: broader covers narrower
+        for (var e : broader.numeric.entrySet()) {
+            String k = e.getKey();
+            Interval b = e.getValue();
+            Interval n = narrower.numeric.get(k);
+            if (n == null) return false;
+            if (!b.covers(n)) return false;
+        }
+
+        // categorical: broader clauses must be contained in narrower
+        for (var e : broader.categorical.entrySet()) {
+            List<String> bClauses = e.getValue();
+            List<String> nClauses = narrower.categorical.get(e.getKey());
+            if (bClauses == null || bClauses.isEmpty()) continue;
+            if (nClauses == null) return false;
+            for (String bc : bClauses) if (!nClauses.contains(bc)) return false;
+        }
+
+        return true;
+    }
+
+    static void writeShadowed(String file) throws Exception {
+        try (PrintWriter out = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+            int count = 0;
+            for (int i = 0; i < PATHS.size(); i++) {
+                Path a = PATHS.get(i);
+                for (int j = i + 1; j < PATHS.size(); j++) {
+                    Path b = PATHS.get(j);
+                    if (subsumes(a, b)) {
+                        count++;
+                        out.println("Rule " + b.id + " is SHADOWED by Rule " + a.id + " (action: " + a.action + ")");
+                        out.println("  Rule " + a.id + " conditions:");
+                        for (String s : renderConditions(a)) out.println("    - " + s);
+                        out.println("  Rule " + b.id + " conditions:");
+                        for (String s : renderConditions(b)) out.println("    - " + s);
+                        out.println();
+                    }
+                }
+            }
+            out.println("TOTAL SHADOWED RELATIONSHIPS: " + count);
+        }
+    }
+
     /* ======================= MAIN ======================= */
 
     public static void main(String[] args) throws Exception {
@@ -722,7 +640,6 @@ public class FsmlAnalyzerMain {
         f.setNamespaceAware(true);
         Document doc = f.newDocumentBuilder().parse(new File(fsml));
 
-        // Parse variable metadata first (bounds + order)
         parseNumericBounds(doc);
         parseVariableOrder(doc);
 
@@ -735,20 +652,18 @@ public class FsmlAnalyzerMain {
         }
         if (strategy == null) throw new IllegalStateException("No <STRATEGY> found.");
 
-        // Start from root NODE inside STRATEGY
+        // Start from first NODE under STRATEGY
         Element rootNode = firstChild(strategy, "NODE");
         if (rootNode == null) throw new IllegalStateException("No <NODE> under <STRATEGY>.");
 
-        // Walk
         walkNode(rootNode, new Path());
 
-        // Outputs
         writeDecisionCsv("decision-table.csv");
         writeHtml("fsml-view.html");
         writeGaps("gap-analysis.txt");
         writeShadowed("shadowed-paths.txt");
 
-        System.out.println("FSML: " + fsml);
+        System.out.println("FSML File: " + fsml);
         System.out.println("TOTAL PATHS: " + PATHS.size());
         System.out.println("Generated:");
         System.out.println("  decision-table.csv");
@@ -760,7 +675,6 @@ public class FsmlAnalyzerMain {
     /* ======================= FORMAT ======================= */
 
     static String fmt(double d) {
-        // Avoid scientific notation, trim .0
         String s = String.format(Locale.US, "%.10f", d);
         s = s.replaceAll("0+$", "").replaceAll("\\.$", "");
         return s;
