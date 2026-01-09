@@ -2,216 +2,238 @@ import org.w3c.dom.*;
 import javax.xml.parsers.*;
 import java.io.*;
 import java.util.*;
-import java.util.stream.Collectors;
 
 public class FsmlAnalyzerAllInOne {
 
-    /* ===================== DATA MODELS ===================== */
+    /* ======================= DATA MODELS ======================= */
 
-    static class Condition {
-        String key;
-        String op;
-        String value;
+    static class Interval {
+        Double min, max;
+
+        Interval(Double min, Double max) {
+            this.min = min;
+            this.max = max;
+        }
+
+        boolean covers(Interval o) {
+            if (o == null) return true;
+            if (min != null && o.min != null && min > o.min) return false;
+            if (max != null && o.max != null && max < o.max) return false;
+            return true;
+        }
 
         public String toString() {
-            return key + " " + op + " " + value;
+            if (min == null && max == null) return "NAN";
+            if (min == null) return "<= " + max;
+            if (max == null) return ">= " + min;
+            return min + " - " + max;
         }
     }
 
     static class Path {
-        List<Condition> conditions = new ArrayList<>();
+        Map<String, Interval> numeric = new LinkedHashMap<>();
+        Map<String, String> categorical = new LinkedHashMap<>();
         String action;
+        int id;
+        boolean invalid = false;
 
-        String signature() {
-            return conditions.stream()
-                    .map(c -> c.key + c.op + c.value)
-                    .sorted()
-                    .collect(Collectors.joining("|")) + "->" + action;
+        Path copy() {
+            Path p = new Path();
+            p.numeric.putAll(this.numeric);
+            p.categorical.putAll(this.categorical);
+            return p;
         }
     }
 
-    static class NumericRange {
-        double min, max;
-        NumericRange(double min, double max) { this.min = min; this.max = max; }
-    }
-
-    /* ===================== STATE ===================== */
-
     static List<Path> paths = new ArrayList<>();
+    static Set<String> allAttributes = new LinkedHashSet<>();
 
-    /* ===================== XML HELPERS ===================== */
+    /* ======================= XML HELPERS ======================= */
 
     static List<Element> children(Element e, String tag) {
         List<Element> out = new ArrayList<>();
         NodeList nl = e.getChildNodes();
         for (int i = 0; i < nl.getLength(); i++) {
-            Node n = nl.item(i);
-            if (n instanceof Element el && el.getNodeName().equalsIgnoreCase(tag)) {
-                out.add(el);
+            if (nl.item(i) instanceof Element) {
+                Element c = (Element) nl.item(i);
+                if (c.getTagName().equals(tag)) out.add(c);
             }
         }
         return out;
     }
 
-    /* ===================== FSML WALK ===================== */
-
-    static void walk(Element node, List<Condition> inherited) {
-        if (node == null) return;
-
-        List<Condition> local = new ArrayList<>(inherited);
-
-        for (Element c : children(node, "CONDITION")) {
-            Condition cond = new Condition();
-            cond.key = c.getAttribute("DecisionKey");
-            cond.op  = c.getAttribute("Type");
-            cond.value = c.getAttribute("Value");
-            local.add(cond);
-        }
-
-        for (Element a : children(node, "ACTION")) {
-            Path p = new Path();
-            p.conditions.addAll(local);
-            p.action = a.getAttribute("Label");
-            paths.add(p);
-        }
-
-        for (Element child : children(node, "NODE")) {
-            walk(child, local);
-        }
+    static Element firstChild(Element e, String tag) {
+        for (Element c : children(e, tag)) return c;
+        return null;
     }
 
-    /* ===================== DECISION TABLE ===================== */
+    /* ======================= CONDITION EXTRACTION ======================= */
 
-    static void writeDecisionTable() throws Exception {
-        try (PrintWriter pw = new PrintWriter("decision-table.csv")) {
-            Set<String> vars = paths.stream()
-                    .flatMap(p -> p.conditions.stream().map(c -> c.key))
-                    .collect(Collectors.toCollection(LinkedHashSet::new));
+    static void extractConditions(Element c, Path p) {
 
-            pw.println(String.join(",", vars) + ",ACTION");
+        String key = c.getAttribute("DecisionKey");
+        String type = c.getAttribute("Type");
+        String val = c.getAttribute("Value");
 
-            for (Path p : paths) {
-                Map<String, List<String>> row = new HashMap<>();
-                for (Condition c : p.conditions) {
-                    row.computeIfAbsent(c.key, k -> new ArrayList<>())
-                            .add(c.op + ":" + c.value);
-                }
+        allAttributes.add(key);
 
-                for (String v : vars) {
-                    pw.print(row.containsKey(v)
-                            ? String.join("&", row.get(v))
-                            : "");
-                    pw.print(",");
-                }
-                pw.println(p.action);
+        if ("and".equalsIgnoreCase(type)) {
+            for (Element sub : children(c, "CONDITION")) {
+                extractConditions(sub, p);
             }
-        }
-    }
-
-    /* ===================== SHADOWED PATHS ===================== */
-
-    static void writeShadowed() throws Exception {
-        try (PrintWriter pw = new PrintWriter("shadowed-paths.txt")) {
-            for (int i = 0; i < paths.size(); i++) {
-                for (int j = 0; j < paths.size(); j++) {
-                    if (i == j) continue;
-                    if (subsumes(paths.get(i), paths.get(j))) {
-                        pw.println("PATH " + j + " shadowed by PATH " + i);
-                    }
-                }
-            }
-        }
-    }
-
-    static boolean subsumes(Path a, Path b) {
-        if (!a.action.equals(b.action)) return false;
-        return b.conditions.containsAll(a.conditions);
-    }
-
-    /* ===================== GAP ANALYSIS ===================== */
-
-    static void writeGaps() throws Exception {
-        try (PrintWriter pw = new PrintWriter("gap-analysis.txt")) {
-            Map<String, List<NumericRange>> ranges = new HashMap<>();
-
-            for (Path p : paths) {
-                for (Condition c : p.conditions) {
-                    if (!c.value.matches("-?\\d+(\\.\\d+)?")) continue;
-                    double v = Double.parseDouble(c.value);
-                    if (c.op.equals("ge")) {
-                        ranges.computeIfAbsent(c.key, k -> new ArrayList<>())
-                                .add(new NumericRange(v, Double.POSITIVE_INFINITY));
-                    }
-                    if (c.op.equals("lt")) {
-                        ranges.computeIfAbsent(c.key, k -> new ArrayList<>())
-                                .add(new NumericRange(Double.NEGATIVE_INFINITY, v));
-                    }
-                }
-            }
-
-            for (var e : ranges.entrySet()) {
-                pw.println("Variable: " + e.getKey());
-                List<NumericRange> rs = e.getValue();
-                rs.sort(Comparator.comparingDouble(r -> r.min));
-                for (int i = 1; i < rs.size(); i++) {
-                    if (rs.get(i - 1).max < rs.get(i).min) {
-                        pw.println("  GAP: " + rs.get(i - 1).max + " to " + rs.get(i).min);
-                    }
-                }
-            }
-        }
-    }
-
-    /* ===================== VISUAL HTML ===================== */
-
-    static void writeHtml() throws Exception {
-        try (PrintWriter pw = new PrintWriter("fsml-visual.html")) {
-            pw.println("""
-                <html><head>
-                <style>
-                body{font-family:Arial}
-                .rule{border:1px solid #ccc;margin:10px;padding:10px;border-radius:8px}
-                .cond{color:#333}
-                .action{background:#ffe0a3;padding:5px;border-radius:6px;display:inline-block}
-                </style></head><body>
-                <h1>FSML Decision Paths</h1>
-                """);
-
-            int i = 1;
-            for (Path p : paths) {
-                pw.println("<div class='rule'><b>Rule " + (i++) + "</b><br/>");
-                for (Condition c : p.conditions) {
-                    pw.println("<div class='cond'>" + c + "</div>");
-                }
-                pw.println("<div class='action'>" + p.action + "</div></div>");
-            }
-
-            pw.println("</body></html>");
-        }
-    }
-
-    /* ===================== MAIN ===================== */
-
-    public static void main(String[] args) throws Exception {
-        if (args.length == 0) {
-            System.err.println("Usage: java FsmlAnalyzerAllInOne <fsml-file>");
             return;
         }
 
-        Document doc = DocumentBuilderFactory.newInstance()
-                .newDocumentBuilder()
-                .parse(new File(args[0]));
+        if (val == null || val.isEmpty()) {
+            p.categorical.put(key, "NAN");
+            return;
+        }
 
-        Element strategy = (Element) doc.getElementsByTagName("STRATEGY").item(0);
-        Element rootNode = (Element) strategy.getElementsByTagName("NODE").item(0);
+        if ("ge".equals(type) || "gt".equals(type) ||
+            "le".equals(type) || "lt".equals(type)) {
 
-        walk(rootNode, new ArrayList<>());
+            Double num = Double.valueOf(val);
+            Interval local;
 
-        writeDecisionTable();
-        writeShadowed();
-        writeGaps();
-        writeHtml();
+            if ("ge".equals(type)) local = new Interval(num, null);
+            else if ("gt".equals(type)) local = new Interval(num + 0.0001, null);
+            else if ("le".equals(type)) local = new Interval(null, num);
+            else local = new Interval(null, num - 0.0001);
 
-        System.out.println("TOTAL PATHS: " + paths.size());
+            Interval base = p.numeric.get(key);
+            if (base == null) {
+                p.numeric.put(key, local);
+            } else {
+                Double min = base.min, max = base.max;
+                if (local.min != null) min = (min == null) ? local.min : Math.max(min, local.min);
+                if (local.max != null) max = (max == null) ? local.max : Math.min(max, local.max);
+                if (min != null && max != null && min > max) {
+                    p.invalid = true;
+                    return;
+                }
+                p.numeric.put(key, new Interval(min, max));
+            }
+        } else {
+            p.categorical.put(key, val);
+        }
+    }
+
+    /* ======================= TREE WALK ======================= */
+
+    static void walk(Element node, Path incoming) {
+
+        Path cur = incoming.copy();
+
+        // AND conditions at this node
+        for (Element c : children(node, "CONDITION")) {
+            extractConditions(c, cur);
+            if (cur.invalid) return;
+        }
+
+        Element act = firstChild(node, "ACTIONS");
+        List<Element> kids = children(node, "NODE");
+
+        if (act != null && kids.isEmpty()) {
+            cur.action = act.getAttribute("Label");
+            cur.id = paths.size() + 1;
+            paths.add(cur);
+            return;
+        }
+
+        for (Element k : kids) {
+            walk(k, cur);
+        }
+    }
+
+    /* ======================= SHADOW DETECTION ======================= */
+
+    static boolean shadows(Path a, Path b) {
+        if (!Objects.equals(a.action, b.action)) return false;
+
+        for (String k : allAttributes) {
+            Interval ai = a.numeric.get(k);
+            Interval bi = b.numeric.get(k);
+            if (ai != null && !ai.covers(bi)) return false;
+
+            String ac = a.categorical.get(k);
+            String bc = b.categorical.get(k);
+            if (ac != null && bc != null && !ac.equals(bc)) return false;
+        }
+        return true;
+    }
+
+    /* ======================= OUTPUT ======================= */
+
+    static void writeCSV() throws Exception {
+        PrintWriter out = new PrintWriter("decision_table.csv");
+        out.print("ID");
+        for (String a : allAttributes) out.print("," + a);
+        out.println(",Action");
+
+        for (Path p : paths) {
+            out.print(p.id);
+            for (String a : allAttributes) {
+                if (p.numeric.containsKey(a)) out.print("," + p.numeric.get(a));
+                else if (p.categorical.containsKey(a)) out.print("," + p.categorical.get(a));
+                else out.print(",NAN");
+            }
+            out.println("," + p.action);
+        }
+        out.close();
+    }
+
+    static void writeHTML() throws Exception {
+        PrintWriter out = new PrintWriter("decision_table.html");
+        out.println("<html><head><style>");
+        out.println("table{border-collapse:collapse;font-family:Arial}");
+        out.println("th,td{border:1px solid #444;padding:6px}");
+        out.println("th{background:#222;color:white}");
+        out.println("</style></head><body>");
+        out.println("<h2>FSML Decision Table</h2>");
+        out.println("<table><tr><th>ID</th>");
+        for (String a : allAttributes) out.println("<th>" + a + "</th>");
+        out.println("<th>Action</th></tr>");
+
+        for (Path p : paths) {
+            out.println("<tr><td>" + p.id + "</td>");
+            for (String a : allAttributes) {
+                if (p.numeric.containsKey(a)) out.println("<td>" + p.numeric.get(a) + "</td>");
+                else if (p.categorical.containsKey(a)) out.println("<td>" + p.categorical.get(a) + "</td>");
+                else out.println("<td>NAN</td>");
+            }
+            out.println("<td>" + p.action + "</td></tr>");
+        }
+        out.println("</table></body></html>");
+        out.close();
+    }
+
+    static void writeShadowAnalysis() throws Exception {
+        PrintWriter out = new PrintWriter("shadowed_paths.txt");
+        for (int i = 0; i < paths.size(); i++) {
+            for (int j = 0; j < paths.size(); j++) {
+                if (i != j && shadows(paths.get(i), paths.get(j))) {
+                    out.println("Path " + paths.get(j).id +
+                            " is shadowed by Path " + paths.get(i).id);
+                }
+            }
+        }
+        out.close();
+    }
+
+    /* ======================= MAIN ======================= */
+
+    public static void main(String[] args) throws Exception {
+
+        DocumentBuilder db = DocumentBuilderFactory.newInstance().newDocumentBuilder();
+        Document doc = db.parse(new File("fsml.xml"));
+
+        Element root = doc.getDocumentElement();
+        walk(root, new Path());
+
+        writeCSV();
+        writeHTML();
+        writeShadowAnalysis();
+
+        System.out.println("Paths generated: " + paths.size());
     }
 }
