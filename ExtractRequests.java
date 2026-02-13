@@ -1,8 +1,12 @@
 import org.w3c.dom.*;
 import javax.xml.parsers.*;
 import java.io.File;
+import java.util.HashMap;
+import java.util.Map;
 
 public class XsdXPathPrinter {
+
+    private static Map<String, Element> complexTypeMap = new HashMap<>();
 
     public static void main(String[] args) throws Exception {
 
@@ -15,12 +19,21 @@ public class XsdXPathPrinter {
         Document doc = builder.parse(file);
         doc.getDocumentElement().normalize();
 
-        NodeList elements = doc.getElementsByTagNameNS("*", "element");
+        // Collect all complexTypes first
+        NodeList complexTypes = doc.getElementsByTagNameNS("*", "complexType");
+        for (int i = 0; i < complexTypes.getLength(); i++) {
+            Element ct = (Element) complexTypes.item(i);
+            if (ct.hasAttribute("name")) {
+                complexTypeMap.put(ct.getAttribute("name"), ct);
+            }
+        }
 
+        // Process all elements
+        NodeList elements = doc.getElementsByTagNameNS("*", "element");
         for (int i = 0; i < elements.getLength(); i++) {
             Element el = (Element) elements.item(i);
 
-            // Only process top-level elements
+            // Only start from root-level elements
             if (el.getParentNode().getLocalName().equals("schema")) {
                 processElement(el, "");
             }
@@ -34,10 +47,9 @@ public class XsdXPathPrinter {
 
         String currentPath = parentPath + "/" + name;
 
-        // Process inline complexType
+        // Inline complexType
         NodeList children = element.getChildNodes();
         for (int i = 0; i < children.getLength(); i++) {
-
             Node node = children.item(i);
             if (node.getNodeType() != Node.ELEMENT_NODE) continue;
 
@@ -48,19 +60,12 @@ public class XsdXPathPrinter {
             }
         }
 
-        // If element references type
+        // Referenced complexType
         if (element.hasAttribute("type")) {
-            String typeName = element.getAttribute("type");
-            typeName = stripNamespace(typeName);
-
-            NodeList complexTypes = element.getOwnerDocument()
-                    .getElementsByTagNameNS("*", "complexType");
-
-            for (int i = 0; i < complexTypes.getLength(); i++) {
-                Element ct = (Element) complexTypes.item(i);
-                if (typeName.equals(ct.getAttribute("name"))) {
-                    processComplexType(ct, currentPath);
-                }
+            String typeName = stripNamespace(element.getAttribute("type"));
+            Element referenced = complexTypeMap.get(typeName);
+            if (referenced != null) {
+                processComplexType(referenced, currentPath);
             }
         }
     }
@@ -75,7 +80,6 @@ public class XsdXPathPrinter {
             if (node.getNodeType() != Node.ELEMENT_NODE) continue;
 
             Element el = (Element) node;
-
             String local = el.getLocalName();
 
             if ("sequence".equals(local) ||
@@ -90,6 +94,36 @@ public class XsdXPathPrinter {
                 if (!attrName.isEmpty()) {
                     System.out.println(parentPath + "/@" + attrName);
                 }
+            }
+
+            // Handle complexContent extension
+            if ("complexContent".equals(local)) {
+                processComplexContent(el, parentPath);
+            }
+        }
+    }
+
+    private static void processComplexContent(Element complexContent, String parentPath) {
+
+        NodeList children = complexContent.getChildNodes();
+
+        for (int i = 0; i < children.getLength(); i++) {
+
+            Node node = children.item(i);
+            if (node.getNodeType() != Node.ELEMENT_NODE) continue;
+
+            Element el = (Element) node;
+
+            if ("extension".equals(el.getLocalName())) {
+
+                String baseType = stripNamespace(el.getAttribute("base"));
+                Element baseComplex = complexTypeMap.get(baseType);
+
+                if (baseComplex != null) {
+                    processComplexType(baseComplex, parentPath);
+                }
+
+                processComplexType(el, parentPath);
             }
         }
     }
